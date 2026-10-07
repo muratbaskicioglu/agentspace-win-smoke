@@ -1,0 +1,91 @@
+# Windows install smoke for the public AgentSpace installer.
+#
+# Downloads a PUBLISHED installer from github.com/muratbaskicioglu/agentspace-releases,
+# checks its sha256, then installs -> launches -> closes -> uninstalls it on a
+# throwaway GitHub-hosted Windows runner.
+#
+# Security notes:
+# - Manual trigger only (workflow_dispatch = users with write access to this repo).
+#   No push / pull_request / pull_request_target / issue_comment triggers.
+# - No secrets. GITHUB_TOKEN is read-only and is not used for the download.
+# - Inputs reach the shell only through env vars and are checked against strict patterns.
+# - Actions are pinned to full commit SHAs.
+name: windows install smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag in agentspace-releases (e.g. v0.3.3)'
+        required: true
+        type: string
+      asset:
+        description: 'Installer file name (e.g. AgentSpace-Setup-0.3.3.exe)'
+        required: true
+        type: string
+      sha256:
+        description: 'Expected sha256 of the installer (64 hex chars)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-install-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: install, launch, close, uninstall
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: download installer + check sha256
+        env:
+          SMOKE_TAG: ${{ inputs.tag }}
+          SMOKE_ASSET: ${{ inputs.asset }}
+          SMOKE_SHA256: ${{ inputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SMOKE_TAG -cnotmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Write-Host "::error::bad tag"; exit 1 }
+          if ($env:SMOKE_ASSET -cnotmatch '^AgentSpace-Setup-[0-9A-Za-z.-]+\.exe$') { Write-Host "::error::bad asset name"; exit 1 }
+          $want = $env:SMOKE_SHA256.Trim().ToLower()
+          if ($want -cnotmatch '^[0-9a-f]{64}$') { Write-Host "::error::bad sha256"; exit 1 }
+          $url = "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$($env:SMOKE_TAG)/$($env:SMOKE_ASSET)"
+          New-Item -ItemType Directory -Force -Path smoke-input | Out-Null
+          $dst = Join-Path 'smoke-input' $env:SMOKE_ASSET
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          $got = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          $bytes = (Get-Item $dst).Length
+          "$got  $bytes  $($env:SMOKE_ASSET)"
+          if ($got -ne $want) { Write-Host "::error::sha256 mismatch: expected $want, got $got"; exit 1 }
+          "| installer | ``$($env:SMOKE_ASSET)`` @ $($env:SMOKE_TAG) · $bytes bytes · sha256 ``$got`` |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: install smoke (silent install, launch, close, 60 s leftover check)
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/installSmoke.ps1 -Dist smoke-input -OutDir install-smoke
+
+      # Runs even if the install smoke is red: if the app is on disk, uninstall is still measured.
+      - name: uninstall smoke (silent uninstall, nothing left)
+        if: ${{ !cancelled() }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/uninstallSmoke.ps1 -OutDir install-smoke
+
+      - name: upload evidence (screenshots, logs, json)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: install-smoke-${{ github.run_id }}
+          path: install-smoke
+          if-no-files-found: warn
+          retention-days: 7
