@@ -258,7 +258,8 @@ $after = @(Get-Procs | Where-Object {
 })
 $result.leftovers = @($after | ForEach-Object { Short $_ })
 Step "no leftover process (+$LingerSec s)" ($after.Count -eq 0) ([ordered]@{ leftover_count = $after.Count; leftovers = $result.leftovers })
-$postShot = Save-Desktop 'after-close-desktop'
+# No desktop screenshot after close: with the app gone it only shows the runner's own
+# console, which does not belong in a public artifact. The verdict is the process list.
 Copy-AppLogs $isoB 'real' $launchAt
 
 # Cleanup: whatever is left (evidence already saved) - only what this script started.
