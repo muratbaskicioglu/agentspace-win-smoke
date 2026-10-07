@@ -114,14 +114,16 @@ function Start-App([string]$exe, $iso, [hashtable]$extraEnv, [string]$tag) {
 }
 function Copy-AppLogs($iso, [string]$tag, [datetime]$since) {
   # The app also writes its log under app.getPath('logs'), which may not be inside
-  # --user-data-dir (on Windows: %APPDATA%\<name>\logs). Only *.log files written
-  # after this launch are copied; nothing else from the profile is kept.
+  # --user-data-dir (on Windows: %APPDATA%\<name>\logs). Only *.log files inside a
+  # 'logs' folder, written after this launch, are copied. Chromium storage files
+  # (leveldb, Session Storage) also end in .log; they are profile data, not logs,
+  # and must not reach the public artifact.
   $dst = (New-Item -ItemType Directory -Force -Path (Join-Path $OutFull "$tag-applogs")).FullName
   $roots = @($iso.root) + @(Get-ChildItem -Path $env:APPDATA -Directory -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -match '^(agentdesk|AgentSpace)' } | ForEach-Object { $_.FullName })
   foreach ($r in $roots) {
     Get-ChildItem -Path $r -Recurse -File -Include *.log -ErrorAction SilentlyContinue |
-      Where-Object { $_.LastWriteTime -ge $since } | Select-Object -First 40 |
+      Where-Object { $_.Directory.Name -eq 'logs' -and $_.LastWriteTime -ge $since } | Select-Object -First 40 |
       ForEach-Object { Copy-Item $_.FullName (Join-Path $dst ($_.Directory.Name + '__' + $_.Name)) -ErrorAction SilentlyContinue }
   }
 }
@@ -245,9 +247,12 @@ if (-not $pb.HasExited) {
 }
 Log "- waiting $LingerSec s (leftover process check)..."
 Start-Sleep -Seconds $LingerSec
-$treePids = @{}; foreach ($t in $treeBefore) { $treePids[[int]$t.ProcessId] = $true }
+# Windows reuses PIDs within seconds, so a PID alone does not identify a process:
+# match on PID + creation time (a reused PID once matched TrustedInstaller.exe).
+function ProcKey($p) { "{0}|{1}" -f $p.ProcessId, $(if ($p.CreationDate) { $p.CreationDate.Ticks } else { '' }) }
+$treeKeys = @{}; foreach ($t in $treeBefore) { $treeKeys[(ProcKey $t)] = $true }
 $after = @(Get-Procs | Where-Object {
-  $treePids.ContainsKey([int]$_.ProcessId) -or
+  $treeKeys.ContainsKey((ProcKey $_)) -or
   ($installDir -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installDir, [StringComparison]::OrdinalIgnoreCase)) -or
   ($_.Name -match $WatchNames -and $_.CreationDate -and $_.CreationDate -ge $launchAt)
 })

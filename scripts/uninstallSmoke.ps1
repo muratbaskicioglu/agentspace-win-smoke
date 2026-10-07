@@ -73,17 +73,25 @@ $parts = Split-Command $cmd
 $uninstExe = $parts[0]; $uninstArgs = $parts[1]
 # Add the silent flag if missing (UninstallString has no /S).
 if ($uninstArgs -notmatch '(^|\s)/S(\s|$)') { $uninstArgs = ($uninstArgs + ' /S').Trim() }
+# The per-user installer leaves InstallLocation EMPTY. Without a folder the exe and
+# process checks in step 3 look at nothing and pass vacuously, so fall back to the
+# uninstaller's own folder (it sits next to the app exe).
+$installDirSource = 'InstallLocation'
+if (-not $installDir -and $uninstExe) { $installDir = Split-Path $uninstExe -Parent; $installDirSource = 'uninstaller folder' }
 $appExes = @()
 if ($installDir -and (Test-Path $installDir)) {
   $appExes = @(Get-ChildItem -Path $installDir -Filter 'AgentSpace*.exe' -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notlike 'Uninstall*' } | ForEach-Object { $_.FullName })
 }
-Step 'uninstall key' ([bool]$uninstExe -and (Test-Path $uninstExe)) ([ordered]@{
+# Positive control: the installed app exe must be found BEFORE uninstalling,
+# otherwise "nothing left" in step 3 would prove nothing.
+$keyOk = [bool]$uninstExe -and (Test-Path $uninstExe) -and ($appExes.Count -gt 0)
+Step 'uninstall key' $keyOk ([ordered]@{
   display_name = Prop $key 'DisplayName'; display_version = Prop $key 'DisplayVersion'
-  install_location = $installDir; quiet_string_present = [bool]$quiet
+  install_location = $installDir; install_location_source = $installDirSource; quiet_string_present = [bool]$quiet
   uninstaller = $uninstExe; args = $uninstArgs; app_exes = $appExes
 })
-if (-not $uninstExe -or -not (Test-Path $uninstExe)) { Save-Result 1; exit 1 }
+if (-not $keyOk) { Save-Result 1; exit 1 }
 
 # -- 2) SILENT UNINSTALL --------------------------------------------------------
 $t0 = Get-Date
