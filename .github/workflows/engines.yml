@@ -1,0 +1,148 @@
+# Engine-path probe for the public AgentSpace installer.
+#
+# Installs a PUBLISHED installer (sha256 checked), then runs scripts/engineProbe.cjs with
+# the installed app's own binary in Node mode, so the app's own shipped modules are
+# measured: pane tree kill, spawn fuse, input box reader, delivery check. Real Codex and
+# OpenCode CLIs from npm (pinned versions) run inside real ConPTY panes.
+#
+# Security notes (same rules as smoke.yml):
+# - Manual trigger only. No push / pull_request / schedule triggers.
+# - No secrets. Engines get a throwaway home and a FAKE API key: nothing can be billed,
+#   and nothing reaches a model (the key is rejected).
+# - Inputs reach the shell only through env vars and are checked against strict patterns.
+# - Actions are pinned to full commit SHAs.
+name: windows engine probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag in agentspace-releases (e.g. v0.4.0)'
+        required: true
+        type: string
+      asset:
+        description: 'Installer file name (e.g. AgentSpace-Setup-0.4.0.exe)'
+        required: true
+        type: string
+      sha256:
+        description: 'Expected sha256 of the installer (64 hex chars)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-engine-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: install, run engine probe, uninstall
+    runs-on: windows-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CODEX_VERSIONS: '0.157.1 0.162.0'
+      OPENCODE_VERSION: '1.18.18'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: download installer + check sha256
+        env:
+          SMOKE_TAG: ${{ inputs.tag }}
+          SMOKE_ASSET: ${{ inputs.asset }}
+          SMOKE_SHA256: ${{ inputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SMOKE_TAG -cnotmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Write-Host "::error::bad tag"; exit 1 }
+          if ($env:SMOKE_ASSET -cnotmatch '^AgentSpace-Setup-[0-9A-Za-z.-]+\.exe$') { Write-Host "::error::bad asset name"; exit 1 }
+          $want = $env:SMOKE_SHA256.Trim().ToLower()
+          if ($want -cnotmatch '^[0-9a-f]{64}$') { Write-Host "::error::bad sha256"; exit 1 }
+          $url = "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$($env:SMOKE_TAG)/$($env:SMOKE_ASSET)"
+          New-Item -ItemType Directory -Force -Path smoke-input | Out-Null
+          $dst = Join-Path 'smoke-input' $env:SMOKE_ASSET
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          $got = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          "$got  $((Get-Item $dst).Length)  $($env:SMOKE_ASSET)"
+          if ($got -ne $want) { Write-Host "::error::sha256 mismatch: expected $want, got $got"; exit 1 }
+
+      - name: silent install
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Get-ChildItem smoke-input -Filter 'AgentSpace-Setup-*.exe' | Select-Object -First 1
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
+          "installer exit $($p.ExitCode)"
+          $exe = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Depth 2 -Filter 'AgentSpace.exe' -File | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::installed AgentSpace.exe not found"; exit 1 }
+          $asar = Join-Path $exe.DirectoryName 'resources\app.asar'
+          if (-not (Test-Path $asar)) { Write-Host "::error::app.asar not found"; exit 1 }
+          "exe  $($exe.FullName)  $($exe.VersionInfo.ProductVersion)"
+          "AS_EXE=$($exe.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "AS_ASAR=$asar" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: install engines from npm (pinned)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pairs = @()
+          foreach ($v in $env:CODEX_VERSIONS.Split(' ')) {
+            if ($v -cnotmatch '^\d+\.\d+\.\d+$') { throw "bad version $v" }
+            $dir = "C:\probe\codex-$v"
+            npm install --global --no-audit --no-fund --prefix $dir "@openai/codex@$v" | Out-Host
+            if (-not (Test-Path (Join-Path $dir 'codex.cmd'))) { throw "codex $v not installed" }
+            $pairs += "v$($v.Replace('.', ''))=$dir"
+          }
+          # OpenCode goes to the normal global npm folder, like a user's install: its own
+          # updater installs there, so the control arm can see whether it updates itself.
+          npm install --global --no-audit --no-fund "opencode-ai@$($env:OPENCODE_VERSION)" | Out-Host
+          $g = (npm prefix --global).Trim()
+          if (-not (Test-Path (Join-Path $g 'opencode.cmd'))) { throw "opencode not installed" }
+          "PROBE_CODEX=$($pairs -join ',')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "PROBE_OPENCODE=g=$g" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          node --version
+
+      - name: engine probe (app's own modules, real ConPTY)
+        run: |
+          $out = Join-Path $PWD 'engine-probe'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          $env:PROBE_NODE = (Get-Command node).Source
+          $argv = @("scripts/engineProbe.cjs", '--app', "`"$env:AS_ASAR`"", '--out', "`"$out`"", '--codex', "`"$env:PROBE_CODEX`"", '--opencode', "`"$env:PROBE_OPENCODE`"")
+          $p = Start-Process -FilePath $env:AS_EXE -ArgumentList $argv -NoNewWindow -PassThru -Wait `
+            -RedirectStandardOutput (Join-Path $out 'stdout.txt') -RedirectStandardError (Join-Path $out 'stderr.txt')
+          Get-Content (Join-Path $out 'stdout.txt')
+          Get-Content (Join-Path $out 'stderr.txt') -ErrorAction SilentlyContinue | Select-Object -Last 40
+          "probe exit $($p.ExitCode)"
+          exit $p.ExitCode
+
+      - name: no leftover engine processes
+        if: ${{ !cancelled() }}
+        run: |
+          Start-Sleep -Seconds 20
+          $left = Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(codex|opencode|AgentSpace)(\.exe)?$' -or ($_.Name -eq 'node.exe' -and $_.CommandLine -match 'agentdesk|app\.asar') }
+          $left | Select-Object ProcessId, ParentProcessId, Name | Format-Table | Out-Host
+          "leftover_count $(@($left).Count)"
+          if (@($left).Count -gt 0) { exit 1 }
+
+      - name: uninstall
+        if: ${{ !cancelled() }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/uninstallSmoke.ps1 -OutDir engine-probe-uninstall
+
+      - name: upload evidence (screens, json)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: engine-probe-${{ github.run_id }}
+          path: |
+            engine-probe
+            engine-probe-uninstall
+          if-no-files-found: warn
+          retention-days: 7
