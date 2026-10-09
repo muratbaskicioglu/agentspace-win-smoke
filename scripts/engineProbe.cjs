@@ -93,11 +93,23 @@ function procTable() {
     return m ? { pid: +m[1], ppid: +m[2], start: m[3], name: path.basename(m[4]) } : null;
   }).filter(Boolean);
 }
+// Windows hands out a dead process's pid again, and the dead process's children keep it
+// as their ParentProcessId. A pane whose pid was such a reused pid would "adopt" them
+// (run 37971756558: csrss, winlogon, dwm, fontdrvhost were listed and reaped, the runner's
+// session died). So a child counts only if it started AFTER its parent.
+const startNum = (p) => (IS_WIN ? Number(p.start) : Date.parse(p.start));
 function descendants(rootPid, table = procTable()) {
-  const out = []; const seen = new Set([rootPid]); let grew = true;
+  const root = table.find((p) => p.pid === rootPid);
+  const born = new Map([[rootPid, root ? startNum(root) : -Infinity]]);
+  const out = []; let grew = true;
   while (grew) {
     grew = false;
-    for (const p of table) if (seen.has(p.ppid) && !seen.has(p.pid)) { seen.add(p.pid); out.push(p); grew = true; }
+    for (const p of table) {
+      if (!born.has(p.ppid) || born.has(p.pid)) continue;
+      const t = startNum(p);
+      if (!(t >= born.get(p.ppid))) continue;
+      born.set(p.pid, t); out.push(p); grew = true;
+    }
   }
   return out;
 }
@@ -107,7 +119,14 @@ function stillAlive(list, table = procTable()) {
   const now = new Set(table.map((p) => `${p.pid}@${p.start}`));
   return list.filter((p) => now.has(`${p.pid}@${p.start}`));
 }
-function reap(list) { for (const p of list) { try { process.kill(p.pid, 'SIGKILL'); } catch { /* gone */ } } }
+// Second guard: never kill a system process by mistake, whatever the tree says.
+const NEVER_REAP = /^(system|smss|csrss|wininit|winlogon|services|lsass|svchost|dwm|fontdrvhost|explorer|sihost|ctfmon|runtimebroker|launchd|kernel_task|systemd|init)(\.exe)?$/i;
+function reap(list) {
+  for (const p of list) {
+    if (NEVER_REAP.test(p.name)) { console.log(`skip reaping system process ${p.name} (${p.pid})`); continue; }
+    try { process.kill(p.pid, 'SIGKILL'); } catch { /* gone */ }
+  }
+}
 
 function spawnPane(file, argv, opts = {}) {
   const t = pty.spawn(file, argv, {
