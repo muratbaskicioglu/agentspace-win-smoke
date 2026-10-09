@@ -376,7 +376,13 @@ async function scenarioOpencode() {
       const work = path.join(home, 'work'); fs.mkdirSync(work);
       const env = envFor(home, dir, extra);
       let plan = null; let planErr = null;
+      // The app reads its own switches (AGENTSPACE_*) from the app process, not from the
+      // pane env: set them here for the duration of buildSpawn only.
+      const own = Object.keys(extra).filter((k) => k.startsWith('AGENTSPACE_'));
+      const saved = own.map((k) => [k, process.env[k]]);
+      for (const k of own) process.env[k] = extra[k];
       try { plan = agentRunner.buildSpawn({ command: 'opencode', agentId: 'probe-worker', cwd: work, disallowSubagent: true }, env, ARGS.app, {}); } catch (e) { planErr = e.message; }
+      for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
       if (!plan) { report(`opencode-${label}-${arm}`, false, { plan_error: planErr }); continue; }
       const target = paneTarget(plan);
       if (!target) { report(`opencode-${label}-${arm}`, false, { resolved: null, plan_file: plan.file }); continue; }
