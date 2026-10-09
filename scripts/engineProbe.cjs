@@ -385,14 +385,23 @@ function activeText(s) {
     return rows.join('\n');
   } catch { return ''; }
 }
-async function startOc(dir, home, tag) {
+async function startOc(dir, home, tag, earlyText) {
   const work = path.join(home, `work-${tag}`); fs.mkdirSync(work, { recursive: true });
   const env = envFor(home, dir, {});
   const plan = agentRunner.buildSpawn({ command: 'opencode', agentId: `probe-${tag}`, cwd: work, disallowSubagent: true }, env, ARGS.app, {});
   const target = paneTarget(plan);
   const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env });
+  // The app writes a delegated prompt once the pane has printed something and ~9 s have
+  // passed. Write the same way at 10 s (no Enter: nothing is sent to a model).
+  let early = null;
+  if (earlyText) {
+    await waitFor(() => s.exit, 10000, 500);
+    early = { written_at_ms: Date.now() - s.startedAt, box_ready_then: ocReady(s) };
+    if (!s.exit) s.t.write(paste.pastePayload(earlyText));
+  }
   const ready = await waitFor(() => ocReady(s) || s.exit, 120000, 500);
-  return { s, plugin: (() => { try { return (JSON.parse(plan.env.OPENCODE_CONFIG_CONTENT || '{}').plugin || []).length; } catch { return null; } })(), readyMs: ready && !s.exit ? Date.now() - s.startedAt : null, exit: s.exit };
+  if (early) { await sleep(3000); early.in_box_after_ready = activeText(s).includes(earlyText.split(' ').pop()); dumpActive(s, `opencode-early-${tag}`); }
+  return { s, early, plugin: (() => { try { return (JSON.parse(plan.env.OPENCODE_CONFIG_CONTENT || '{}').plugin || []).length; } catch { return null; } })(), readyMs: ready && !s.exit ? Date.now() - s.startedAt : null, exit: s.exit };
 }
 async function closeOc(list) {
   const before = list.flatMap((x) => (x.s.exit ? [] : descendants(x.s.t.pid)));
@@ -405,12 +414,12 @@ async function closeOc(list) {
 async function scenarioOpencodeStart() {
   for (const { label, dir } of ARGS.opencode) {
     const home = isoHome(`ocs-${label}`);
-    const first = await startOc(dir, home, 'first');
+    const first = await startOc(dir, home, 'first', 'Probe teslim metni mark-oc1');
     const left1 = await closeOc([first]);
     const second = await startOc(dir, home, 'second');
     const left2 = await closeOc([second]);
     report(`opencode-${label}-start-first-vs-second`, first.readyMs !== null && second.readyMs !== null && left1.length + left2.length === 0, {
-      plugin: first.plugin, first_ready_ms: first.readyMs, first_exit: first.exit, second_ready_ms: second.readyMs, second_exit: second.exit, leftover: [...left1, ...left2],
+      plugin: first.plugin, first_ready_ms: first.readyMs, early_write: first.early, first_exit: first.exit, second_ready_ms: second.readyMs, second_exit: second.exit, leftover: [...left1, ...left2],
     });
     const home3 = isoHome(`ocp-${label}`);
     const three = await Promise.all([1, 2, 3].map((i) => startOc(dir, home3, `p${i}`)));
