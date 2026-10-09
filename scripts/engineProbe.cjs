@@ -54,6 +54,16 @@ const paste = app('pastePayload.cjs');
 const agentRunner = app('agentRunner.js');
 const rollout = app('codexRolloutProbe.cjs');
 const restartResume = app('restartResume.cjs');
+const engineInstall = app('engineInstall.cjs');
+
+// What the app's main process does after buildSpawn: find the binary on the pane's PATH
+// and, on Windows, wrap a .cmd shim the way node-pty needs it.
+function paneTarget(plan) {
+  const bin = engineInstall.resolveBinary(plan.file, plan.env);
+  if (!bin) return null;
+  if (IS_WIN) { const t = engineInstall.execArgs(bin, plan.argv); return { file: t.file, argv: t.commandLine || t.argv, bin }; }
+  return { file: bin, argv: plan.argv, bin };
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
@@ -269,9 +279,9 @@ async function scenarioCodex() {
     const env = envFor(h.home, dir, { CODEX_HOME: h.codexHome });
     let plan = null; let planErr = null;
     try { plan = agentRunner.buildSpawn({ command: 'codex', agentId: 'probe-worker', cwd: h.work, disallowSubagent: true }, env, ARGS.app, {}); } catch (e) { planErr = e.message; }
-    const file = plan ? plan.file : (IS_WIN ? path.join(dir, 'codex.cmd') : path.join(dir, 'codex'));
-    const argv = plan ? plan.argv : [];
-    const s = spawnPane(file, argv, { cwd: h.work, env: plan ? { ...plan.env, CODEX_HOME: h.codexHome } : env });
+    const target = plan ? paneTarget(plan) : null;
+    if (!target) { report(`codex-${label}-spawn`, false, { plan_error: planErr, resolved: null }); continue; }
+    const s = spawnPane(target.file, target.argv, { cwd: h.work, env: plan ? { ...plan.env, CODEX_HOME: h.codexHome } : env });
     // Wait for the input box (or give up after 60 s and save whatever is on screen).
     const reached = await waitFor(() => /Ask Codex|›\s/.test(liveText(s)) || s.exit, 60000, 500);
     // The app's spawn argv carries the identity as the first prompt, so Codex starts a
@@ -291,7 +301,7 @@ async function scenarioCodex() {
     const idle = composer.composerDiag(composerText(s), { ignoreRunning: true });
     const idleCodex = composer.composerDiag(composerText(s), { ignoreRunning: true, engine: 'codex' });
     report(`codex-${label}-idle-box`, idle.verdict === 'empty', {
-      plan: plan ? { file: path.basename(plan.file), argc: plan.argv.length } : { error: planErr },
+      plan: { file: path.basename(plan.file), bin: path.basename(target.bin), spawn: path.basename(target.file), argc: plan.argv.length },
       box_reached: reached && !s.exit, turn_seen: turnSeen, turn_ended: turnEnded, exit: s.exit,
       verdict: idle.verdict, branch: idle.branch, row: idle.row, verdict_engine_codex: idleCodex.verdict,
       tail: idle.rows,
@@ -302,7 +312,7 @@ async function scenarioCodex() {
     await sleep(3000);
     saveScreen(`codex-${label}-typed`, s);
     const typed = composer.composerDiag(composerText(s), { ignoreRunning: true });
-    const screen = liveText(s);
+    const screen = s.screen.liveLines().slice(-6).join('\n');
     const lost = [...new Set([...PROBE_TEXT].filter((ch) => ch.trim() && !screen.includes(ch)))];
     report(`codex-${label}-typed-text`, typed.verdict === 'text' && lost.length === 0, {
       verdict: typed.verdict, branch: typed.branch, lost_on_screen: lost,
@@ -368,8 +378,10 @@ async function scenarioOpencode() {
       let plan = null; let planErr = null;
       try { plan = agentRunner.buildSpawn({ command: 'opencode', agentId: 'probe-worker', cwd: work, disallowSubagent: true }, env, ARGS.app, {}); } catch (e) { planErr = e.message; }
       if (!plan) { report(`opencode-${label}-${arm}`, false, { plan_error: planErr }); continue; }
+      const target = paneTarget(plan);
+      if (!target) { report(`opencode-${label}-${arm}`, false, { resolved: null, plan_file: plan.file }); continue; }
       const verBefore = versionOf(dir);
-      const s = spawnPane(plan.file, plan.argv, { cwd: work, env: plan.env });
+      const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env });
       await waitFor(() => s.exit, 25000, 500);
       saveScreen(`opencode-${label}-${arm}`, s);
       const alive = !s.exit;
@@ -382,7 +394,7 @@ async function scenarioOpencode() {
       const cfg = (() => { try { return JSON.parse(plan.env.OPENCODE_CONFIG_CONTENT || '{}'); } catch { return {}; } })();
       report(`opencode-${label}-${arm}`, arm === 'autoupdate-on' ? true : alive && left.length === 0, {
         expect: arm === 'autoupdate-on' ? 'measured only (control arm)' : 'alive at 25 s, leftover 0',
-        alive_25s: alive, exit_before_25s: alive ? null : s.exit, bytes: s.bytes,
+        bin: path.basename(target.bin), spawn: path.basename(target.file), alive_25s: alive, exit_before_25s: alive ? null : s.exit, bytes: s.bytes,
         env_autoupdate: plan.env.OPENCODE_DISABLE_AUTOUPDATE || null, plugin_in_config: Array.isArray(cfg.plugin) ? cfg.plugin.length : 0,
         version_before: verBefore, version_after: versionOf(dir),
         descendants_before: before.map((p) => p.name), leftover: left.map((p) => p.name),
