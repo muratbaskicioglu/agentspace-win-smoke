@@ -189,6 +189,27 @@ async function scenarioStorm() {
   report('storm-closed-panes-not-counted', killed.every((k) => k.check_after === true), { rounds: killed });
 }
 
+// ---------- burst ----------
+// 512 KB of "X" in one write. The raw pty stream is compared with what the app's own
+// screen model (paneScreen, xterm) ends up holding: the stream may carry extra bytes
+// (ConPTY repaints), but the terminal content must hold exactly the bytes written.
+async function scenarioBurst() {
+  const N = 512 * 1024; const cols = 200; const rows = 50;
+  const node = process.env.PROBE_NODE || 'node';
+  const s = spawnPane(node, ['-e', `process.stdout.write('X'.repeat(${N}) + '\\r\\nDONE\\r\\n')`], { cols, rows });
+  // A screen model with room for the whole burst (the app's default keeps 2000 rows).
+  const big = paneScreen.createPaneScreen({ cols, rows, scrollback: 10000 });
+  let raw = '';
+  s.t.onData((d) => { raw += d; big.write(d); });
+  await waitFor(() => s.exit && /DONE/.test(raw), 120000, 250);
+  await sleep(500);
+  const b = big.term.buffer.active;
+  let inBuffer = 0;
+  for (let i = 0; i < b.length; i++) { const l = b.getLine(i); if (l) inBuffer += (l.translateToString(true).match(/X/g) || []).length; }
+  const rawX = (raw.match(/X/g) || []).length;
+  report('burst-512k', inBuffer === N, { expected: N, in_terminal: inBuffer, raw_stream_x: rawX, raw_extra: rawX - N, wrapped_rows: Math.ceil(N / cols), bytes: raw.length, exit: s.exit });
+}
+
 // ---------- chars ----------
 const PROBE_TEXT = 'Görev · ölçüm — durum ⛔ bitti… “tırnak” ‘tek’ → ✓ ışık ÇĞİÖŞÜ 🚀 end';
 async function scenarioChars() {
@@ -381,7 +402,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
