@@ -388,8 +388,21 @@ async function scenarioOpencode() {
       if (!target) { report(`opencode-${label}-${arm}`, false, { resolved: null, plan_file: plan.file }); continue; }
       const verBefore = versionOf(dir);
       const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env });
-      await waitFor(() => s.exit, 25000, 500);
+      // Timeline: bytes drawn and child processes (MCP servers) every 5 s for 45 s.
+      const timeline = [];
+      for (let t = 5; t <= 45 && !s.exit; t += 5) {
+        await waitFor(() => s.exit, 5000, 500);
+        const kids = s.exit ? [] : descendants(s.t.pid).filter((p) => !/^conhost/i.test(p.name));
+        timeline.push({ t, bytes: s.bytes, children: kids.map((p) => p.name) });
+      }
       saveScreen(`opencode-${label}-${arm}`, s);
+      // OpenCode draws on the alternate screen: dump the ACTIVE buffer as well.
+      try {
+        const b = s.screen.term.buffer.active;
+        const rows = [];
+        for (let i = 0; i < b.length; i++) { const l = b.getLine(i); if (l) rows.push(l.translateToString(true)); }
+        fs.writeFileSync(path.join(ARGS.out, `opencode-${label}-${arm}.active.txt`), `${b.type}\n${rows.join('\n')}\n`);
+      } catch { /* screen model gone */ }
       const alive = !s.exit;
       const before = alive ? descendants(s.t.pid) : [];
       if (alive) treeKill.killPaneTreesSync([s.t]);
@@ -399,12 +412,11 @@ async function scenarioOpencode() {
       reap(left);
       const cfg = (() => { try { return JSON.parse(plan.env.OPENCODE_CONFIG_CONTENT || '{}'); } catch { return {}; } })();
       report(`opencode-${label}-${arm}`, arm === 'autoupdate-on' ? true : alive && left.length === 0, {
-        expect: arm === 'autoupdate-on' ? 'measured only (control arm)' : 'alive at 25 s, leftover 0',
-        bin: path.basename(target.bin), spawn: path.basename(target.file), alive_25s: alive, exit_before_25s: alive ? null : s.exit, bytes: s.bytes,
+        expect: arm === 'autoupdate-on' ? 'measured only (control arm)' : 'alive at 45 s, leftover 0',
+        bin: path.basename(target.bin), spawn: path.basename(target.file), exit_before_25s: alive ? null : s.exit, bytes: s.bytes,
         env_autoupdate: plan.env.OPENCODE_DISABLE_AUTOUPDATE || null, plugin_in_config: Array.isArray(cfg.plugin) ? cfg.plugin.length : 0,
         version_before: verBefore, version_after: versionOf(dir),
         descendants_before: before.map((p) => p.name), leftover: left.map((p) => p.name),
-        last_lines: liveText(s).split('\n').filter((l) => l.trim()).slice(-6),
       });
     }
   }
