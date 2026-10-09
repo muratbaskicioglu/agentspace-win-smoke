@@ -413,7 +413,7 @@ async function scenarioOpencode() {
       const cfg = (() => { try { return JSON.parse(plan.env.OPENCODE_CONFIG_CONTENT || '{}'); } catch { return {}; } })();
       report(`opencode-${label}-${arm}`, arm === 'autoupdate-on' ? true : alive && left.length === 0, {
         expect: arm === 'autoupdate-on' ? 'measured only (control arm)' : 'alive at 45 s, leftover 0',
-        bin: path.basename(target.bin), spawn: path.basename(target.file), exit_before_25s: alive ? null : s.exit, bytes: s.bytes,
+        bin: path.basename(target.bin), spawn: path.basename(target.file), alive_45s: alive, exit_before_45s: alive ? null : s.exit, bytes: s.bytes, timeline,
         env_autoupdate: plan.env.OPENCODE_DISABLE_AUTOUPDATE || null, plugin_in_config: Array.isArray(cfg.plugin) ? cfg.plugin.length : 0,
         version_before: verBefore, version_after: versionOf(dir),
         descendants_before: before.map((p) => p.name), leftover: left.map((p) => p.name),
