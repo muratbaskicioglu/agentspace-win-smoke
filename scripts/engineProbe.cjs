@@ -373,6 +373,54 @@ function dumpActive(s, name) {
   } catch { /* screen model gone */ }
 }
 
+// ---------- opencode-start ----------
+// With an external plugin in its config, OpenCode waits for a dependency install into
+// its config folder before it loads. Measure: first start in a fresh home, a second
+// start in the SAME home, and three panes started at once in another fresh home.
+function ocReady(s) { return /Ask anything/.test(activeText(s)); }
+function activeText(s) {
+  try {
+    const b = s.screen.term.buffer.active; const rows = [];
+    for (let i = 0; i < b.length; i++) { const l = b.getLine(i); if (l) rows.push(l.translateToString(true)); }
+    return rows.join('\n');
+  } catch { return ''; }
+}
+async function startOc(dir, home, tag) {
+  const work = path.join(home, `work-${tag}`); fs.mkdirSync(work, { recursive: true });
+  const env = envFor(home, dir, {});
+  const plan = agentRunner.buildSpawn({ command: 'opencode', agentId: `probe-${tag}`, cwd: work, disallowSubagent: true }, env, ARGS.app, {});
+  const target = paneTarget(plan);
+  const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env });
+  const ready = await waitFor(() => ocReady(s) || s.exit, 120000, 500);
+  return { s, plugin: (() => { try { return (JSON.parse(plan.env.OPENCODE_CONFIG_CONTENT || '{}').plugin || []).length; } catch { return null; } })(), readyMs: ready && !s.exit ? Date.now() - s.startedAt : null, exit: s.exit };
+}
+async function closeOc(list) {
+  const before = list.flatMap((x) => (x.s.exit ? [] : descendants(x.s.t.pid)));
+  treeKill.killPaneTreesSync(list.map((x) => x.s.t));
+  await waitFor(() => list.every((x) => x.s.exit), 10000);
+  await sleep(2500);
+  const left = stillAlive(before); reap(left);
+  return left.map((p) => p.name);
+}
+async function scenarioOpencodeStart() {
+  for (const { label, dir } of ARGS.opencode) {
+    const home = isoHome(`ocs-${label}`);
+    const first = await startOc(dir, home, 'first');
+    const left1 = await closeOc([first]);
+    const second = await startOc(dir, home, 'second');
+    const left2 = await closeOc([second]);
+    report(`opencode-${label}-start-first-vs-second`, first.readyMs !== null && second.readyMs !== null && left1.length + left2.length === 0, {
+      plugin: first.plugin, first_ready_ms: first.readyMs, first_exit: first.exit, second_ready_ms: second.readyMs, second_exit: second.exit, leftover: [...left1, ...left2],
+    });
+    const home3 = isoHome(`ocp-${label}`);
+    const three = await Promise.all([1, 2, 3].map((i) => startOc(dir, home3, `p${i}`)));
+    const left3 = await closeOc(three);
+    report(`opencode-${label}-start-3-parallel`, three.every((x) => x.readyMs !== null) && left3.length === 0, {
+      ready_ms: three.map((x) => x.readyMs), exits: three.map((x) => x.exit), leftover: left3,
+    });
+  }
+}
+
 // ---------- opencode ----------
 async function scenarioOpencode() {
   for (const { label, dir } of ARGS.opencode) {
@@ -445,7 +493,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
