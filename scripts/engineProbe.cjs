@@ -363,6 +363,16 @@ async function scenarioCodex() {
   }
 }
 
+// OpenCode draws on the alternate screen: dump the ACTIVE buffer.
+function dumpActive(s, name) {
+  try {
+    const b = s.screen.term.buffer.active;
+    const rows = [];
+    for (let i = 0; i < b.length; i++) { const l = b.getLine(i); if (l) rows.push(l.translateToString(true)); }
+    fs.writeFileSync(path.join(ARGS.out, `${name}.active.txt`), `${b.type}\n${rows.join('\n')}\n`);
+  } catch { /* screen model gone */ }
+}
+
 // ---------- opencode ----------
 async function scenarioOpencode() {
   for (const { label, dir } of ARGS.opencode) {
@@ -394,15 +404,18 @@ async function scenarioOpencode() {
         await waitFor(() => s.exit, 5000, 500);
         const kids = s.exit ? [] : descendants(s.t.pid).filter((p) => !/^conhost/i.test(p.name));
         timeline.push({ t, bytes: s.bytes, children: kids.map((p) => p.name) });
+        if (t === 10) dumpActive(s, `opencode-${label}-${arm}-t10`);
       }
-      saveScreen(`opencode-${label}-${arm}`, s);
-      // OpenCode draws on the alternate screen: dump the ACTIVE buffer as well.
+      // OpenCode's own log (under the throwaway home): which startup step waited.
       try {
-        const b = s.screen.term.buffer.active;
-        const rows = [];
-        for (let i = 0; i < b.length; i++) { const l = b.getLine(i); if (l) rows.push(l.translateToString(true)); }
-        fs.writeFileSync(path.join(ARGS.out, `opencode-${label}-${arm}.active.txt`), `${b.type}\n${rows.join('\n')}\n`);
-      } catch { /* screen model gone */ }
+        const logDir = path.join(home, '.local', 'share', 'opencode', 'log');
+        for (const f of fs.readdirSync(logDir)) {
+          const body = fs.readFileSync(path.join(logDir, f), 'utf8').split('\n').slice(0, 400).join('\n');
+          fs.writeFileSync(path.join(ARGS.out, `opencode-${label}-${arm}.log.txt`), body.replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-***'));
+        }
+      } catch { /* no log */ }
+      saveScreen(`opencode-${label}-${arm}`, s);
+      dumpActive(s, `opencode-${label}-${arm}`);
       const alive = !s.exit;
       const before = alive ? descendants(s.t.pid) : [];
       if (alive) treeKill.killPaneTreesSync([s.t]);
