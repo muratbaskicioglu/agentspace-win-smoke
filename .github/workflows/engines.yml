@@ -4,6 +4,8 @@
 # the installed app's own binary in Node mode, so the app's own shipped modules are
 # measured: pane tree kill, spawn fuse, input box reader, delivery check. Real Codex and
 # OpenCode CLIs from npm (pinned versions) run inside real ConPTY panes.
+# scripts/gate/*.cjs: the app's delivery gate (window-side code, minified, same as what the
+# installer ships) built from the release (base) and from a change under test (fix).
 #
 # Security notes (same rules as smoke.yml):
 # - Manual trigger only. No push / pull_request / schedule triggers.
@@ -28,6 +30,11 @@ on:
         description: 'Expected sha256 of the installer (64 hex chars)'
         required: true
         type: string
+      only:
+        description: 'Scenarios to run, comma separated (empty = all; e.g. gate)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -110,12 +117,16 @@ jobs:
           node --version
 
       - name: engine probe (app's own modules, real ConPTY)
+        env:
+          PROBE_ONLY: ${{ inputs.only }}
         run: |
+          if ($env:PROBE_ONLY -cnotmatch '^[a-z,]*$') { Write-Host "::error::bad scenario list"; exit 1 }
           $out = Join-Path $PWD 'engine-probe'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $env:ELECTRON_RUN_AS_NODE = '1'
           $env:PROBE_NODE = (Get-Command node).Source
           $argv = @("scripts/engineProbe.cjs", '--app', "`"$env:AS_ASAR`"", '--out', "`"$out`"", '--codex', "`"$env:PROBE_CODEX`"", '--opencode', "`"$env:PROBE_OPENCODE`"")
+          if ($env:PROBE_ONLY) { $argv += @('--only', $env:PROBE_ONLY) }
           $p = Start-Process -FilePath $env:AS_EXE -ArgumentList $argv -NoNewWindow -PassThru -Wait `
             -RedirectStandardOutput (Join-Path $out 'stdout.txt') -RedirectStandardError (Join-Path $out 'stderr.txt')
           Get-Content (Join-Path $out 'stdout.txt')

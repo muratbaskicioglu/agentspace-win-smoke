@@ -15,6 +15,7 @@
 //   chars     which characters reach a raw-mode TUI through the pty (no engine involved)
 //   codex     real Codex TUI: empty input box read by the app's reader, then typed text
 //   opencode  real OpenCode pane with the app's own argv/env: alive after 25 s? leftovers?
+//   gate      the app's delivery gate drives a real OpenCode FIRST start (see scenarioGate)
 'use strict';
 const fs = require('node:fs');
 const os = require('node:os');
@@ -491,6 +492,95 @@ async function scenarioOpencode() {
     }
   }
 }
+// ---------- gate ----------
+// The app's delivery gate decides when the first task text is typed into a new engine
+// pane. That code runs in the app window, so it is not loadable from app.asar as a
+// module: scripts/gate/gate-<build>.cjs are the same source files built into one file
+// each (base = the release's code, fix = the change under test). The gate drives a REAL
+// OpenCode first start in a fresh home. The task text is typed but Enter is held back,
+// so nothing is sent to a model. Measured: when the gate typed, its verdict, and whether
+// the text is in OpenCode's input box once OpenCode is ready.
+const PANE_BUFFER_MAX = 256 * 1024; // the app's attach buffer (rolling window)
+async function gateArm(dir, label, arm, home, opts) {
+  const gate = require(path.join(__dirname, 'gate', `gate-${opts.build}.cjs`));
+  const work = path.join(home, `work-${arm}`); fs.mkdirSync(work, { recursive: true });
+  const env = envFor(home, dir, {});
+  // The app's spawn code writes its plugin/profile files under AGENTDESK_HOME of the APP
+  // process: point it at the throwaway home while the plan is built.
+  const savedHome = process.env.AGENTDESK_HOME;
+  process.env.AGENTDESK_HOME = env.AGENTDESK_HOME;
+  let plan;
+  try { plan = agentRunner.buildSpawn({ command: 'opencode', agentId: `probe-gate-${arm}`, cwd: work, disallowSubagent: true }, env, ARGS.app, {}); }
+  finally { if (savedHome === undefined) delete process.env.AGENTDESK_HOME; else process.env.AGENTDESK_HOME = savedHome; }
+  const target = paneTarget(plan);
+  let s = null; let tail = '';
+  const chunks = []; const writes = []; const boot = [];
+  const since = () => (s ? Date.now() - s.startedAt : 0);
+  const api = {
+    async spawn() {
+      s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env });
+      s.t.onData((d) => {
+        tail = (tail + d).slice(-PANE_BUFFER_MAX);
+        if (opts.keepRaw && since() <= 20000) chunks.push([since(), d]);
+      });
+      return { paneId: 'p1', agentId: `probe-gate-${arm}` };
+    },
+    write(_p, data) {
+      if (data === '\r') { writes.push({ ms: since(), enter: 'held back' }); return; }
+      writes.push({ ms: since(), chars: data.length });
+      if (!s.exit) s.t.write(data);
+    },
+    async list() { return []; }, async kill() {}, async bind() {},
+    onData() { return () => {}; }, onExit() { return () => {}; },
+    async attach() { return { ok: true, buffer: tail, command: 'opencode' }; },
+  };
+  let trace = null;
+  const probes = { detectBlocker: gate.detectBlocker, composerReady: gate.composerReady, turnPending: gate.turnPending, readyQuietMs: gate.readyQuietMs };
+  if (opts.build === 'fix') {
+    probes.bootCapMs = opts.capMs ? () => opts.capMs : gate.bootCapMs;
+    probes.screenBlank = gate.screenBlank;
+    probes.onBootWait = (_p, phase, info) => boot.push({ phase, ms: since(), verdict: info.verdict || null });
+  }
+  // readPane = the app's attach buffer (delegationRunner.readPaneTail reads exactly this).
+  const runner = gate.engineAwareRunner(api, { readPane: async () => tail, verifySubmit: false, onReadyTrace: (_p, t) => { trace = { verdict: t.verdict, waited_ms: t.waitedMs, at_ms: since(), saw_bytes: t.sawBytes, engine: t.engine }; }, ...probes });
+  await runner.spawn({ command: 'opencode' });
+  const needle = `mark${arm.replace(/[^a-z0-9]/g, '')}${Math.random().toString(36).slice(2, 8)}`;
+  runner.write('p1', `Probe teslim metni ${needle}\r`);
+  await waitFor(() => trace || s.exit, 140000, 250);
+  // The placeholder ("Ask anything") goes away once text is typed: read the footer instead.
+  const footer = () => /ctrl\+p commands/.test(activeText(s));
+  const ready = await waitFor(() => footer() || s.exit, 120000, 500);
+  const readyMs = ready && !s.exit ? since() : null;
+  await sleep(3000);
+  const inBox = activeText(s).includes(needle);
+  dumpActive(s, `gate-${label}-${arm}`);
+  if (opts.keepRaw) fs.writeFileSync(path.join(ARGS.out, `gate-${label}-${arm}.raw-first-20s.json`), `${JSON.stringify(chunks)}\n`);
+  const left = await closeOc([{ s }]);
+  return { trace, writes, boot, ready_ms: readyMs, text_in_box: inBox, exit: s.exit, leftover: left };
+}
+async function scenarioGate() {
+  for (const { label, dir } of ARGS.opencode) {
+    // 1) base: the release's gate on a first start. Expected: types at ~9-10 s into the
+    //    blank screen and the text is lost (control arm, expected red).
+    const b = await gateArm(dir, label, 'base', isoHome(`gate-${label}-b`), { build: 'base', keepRaw: true });
+    report(`gate-${label}-base-first-start`, b.text_in_box, { expect: 'control arm: text lost (red)', ...b });
+    // 2) fix: same first start. Expected: waits while the screen is blank, types once the
+    //    input box is drawn (verdict composer), text in the box. Then a second start in the
+    //    same home (OpenCode is fast now): no extra wait, no first-start notice.
+    const home = isoHome(`gate-${label}-f`);
+    const f = await gateArm(dir, label, 'fix', home, { build: 'fix', keepRaw: true });
+    report(`gate-${label}-fix-first-start`, f.text_in_box && f.trace && f.trace.verdict === 'composer' && f.leftover.length === 0, { expect: 'composer, text in box', ...f });
+    const f2 = await gateArm(dir, label, 'fix-second', home, { build: 'fix' });
+    report(`gate-${label}-fix-second-start`, f2.text_in_box && f2.trace && f2.trace.verdict === 'composer' && f2.boot.length === 0, { expect: 'composer, no notice', ...f2 });
+    // 3) fix with a short ceiling (20 s instead of 120 s) on a first start: the honest
+    //    result. Expected: verdict boot-cap, NOTHING typed, notice start then end(boot-cap).
+    // PROBE_GATE_CAP_MS: the short ceiling must be shorter than this machine's first start.
+    const capMs = Number(process.env.PROBE_GATE_CAP_MS) || 20000;
+    const c = await gateArm(dir, label, 'fix-cap', isoHome(`gate-${label}-c`), { build: 'fix', capMs });
+    report(`gate-${label}-fix-cap-honest`, !!c.trace && c.trace.verdict === 'boot-cap' && c.writes.length === 0 && !c.text_in_box, { expect: 'boot-cap, nothing typed', cap_ms: capMs, ...c });
+  }
+}
+
 function versionOf(binDir) {
   try {
     const pkg = path.join(binDir, IS_WIN ? '' : '..', 'lib', 'node_modules', 'opencode-ai', 'package.json');
@@ -502,7 +592,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['gate', scenarioGate]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
