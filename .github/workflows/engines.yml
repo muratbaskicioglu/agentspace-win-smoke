@@ -3,7 +3,8 @@
 # Installs a PUBLISHED installer (sha256 checked), then runs scripts/engineProbe.cjs with
 # the installed app's own binary in Node mode, so the app's own shipped modules are
 # measured: pane tree kill, spawn fuse, input box reader, delivery check. Real Codex and
-# OpenCode CLIs from npm (pinned versions) run inside real ConPTY panes.
+# OpenCode CLIs from npm and Claude Code (native installer + npm; pinned versions) run inside
+# real ConPTY panes.
 # scripts/gate/*.cjs: the app's delivery gate (window-side code, minified, same as what the
 # installer ships) built from the release (base) and from a change under test (fix).
 #
@@ -56,6 +57,7 @@ jobs:
     env:
       CODEX_VERSIONS: '0.157.1 0.162.0'
       OPENCODE_VERSION: '1.18.18'
+      CLAUDE_VERSION: '2.1.300'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -112,6 +114,17 @@ jobs:
           npm install --global --no-audit --no-fund "opencode-ai@$($env:OPENCODE_VERSION)" | Out-Host
           $g = (npm prefix --global).Trim()
           if (-not (Test-Path (Join-Path $g 'opencode.cmd'))) { throw "opencode not installed" }
+          # Claude Code, two ways customers install it: the native installer the app itself offers
+          # (claude.exe under %USERPROFILE%\.local\bin) and npm (claude.cmd behind cmd.exe).
+          if ($env:CLAUDE_VERSION -cnotmatch '^\d+\.\d+\.\d+$') { throw "bad claude version" }
+          & ([scriptblock]::Create((Invoke-RestMethod -UseBasicParsing https://claude.ai/install.ps1))) $env:CLAUDE_VERSION | Out-Host
+          $native = Join-Path $env:USERPROFILE '.local\bin'
+          if (-not (Test-Path (Join-Path $native 'claude.exe'))) { throw "native claude not installed" }
+          & (Join-Path $native 'claude.exe') --version | Out-Host
+          $cdir = "C:\probe\claude-npm"
+          npm install --global --no-audit --no-fund --prefix $cdir "@anthropic-ai/claude-code@$($env:CLAUDE_VERSION)" | Out-Host
+          if (-not (Test-Path (Join-Path $cdir 'claude.cmd'))) { throw "npm claude not installed" }
+          "PROBE_CLAUDE=native=$native,npm=$cdir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "PROBE_CODEX=$($pairs -join ',')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "PROBE_OPENCODE=g=$g" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           node --version
@@ -125,7 +138,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $env:ELECTRON_RUN_AS_NODE = '1'
           $env:PROBE_NODE = (Get-Command node).Source
-          $argv = @("scripts/engineProbe.cjs", '--app', "`"$env:AS_ASAR`"", '--out', "`"$out`"", '--codex', "`"$env:PROBE_CODEX`"", '--opencode', "`"$env:PROBE_OPENCODE`"")
+          $argv = @("scripts/engineProbe.cjs", '--app', "`"$env:AS_ASAR`"", '--out', "`"$out`"", '--codex', "`"$env:PROBE_CODEX`"", '--opencode', "`"$env:PROBE_OPENCODE`"", '--claude', "`"$env:PROBE_CLAUDE`"")
           if ($env:PROBE_ONLY) { $argv += @('--only', $env:PROBE_ONLY) }
           $p = Start-Process -FilePath $env:AS_EXE -ArgumentList $argv -NoNewWindow -PassThru -Wait `
             -RedirectStandardOutput (Join-Path $out 'stdout.txt') -RedirectStandardError (Join-Path $out 'stderr.txt')
@@ -138,7 +151,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           Start-Sleep -Seconds 20
-          $left = Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(codex|opencode|AgentSpace)(\.exe)?$' -or ($_.Name -eq 'node.exe' -and $_.CommandLine -match 'agentdesk|app\.asar') }
+          $left = Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(codex|opencode|claude|AgentSpace)(\.exe)?$' -or ($_.Name -eq 'node.exe' -and $_.CommandLine -match 'agentdesk|app\.asar') }
           $left | Select-Object ProcessId, ParentProcessId, Name | Format-Table | Out-Host
           "leftover_count $(@($left).Count)"
           if (@($left).Count -gt 0) { exit 1 }

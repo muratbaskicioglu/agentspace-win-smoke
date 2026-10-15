@@ -16,6 +16,7 @@
 //   codex     real Codex TUI: empty input box read by the app's reader, then typed text
 //   opencode  real OpenCode pane with the app's own argv/env: alive after 25 s? leftovers?
 //   gate      the app's delivery gate drives a real OpenCode FIRST start (see scenarioGate)
+//   claude    real Claude Code pane built like the app's main process: alive? what did it print?
 'use strict';
 const fs = require('node:fs');
 const os = require('node:os');
@@ -24,7 +25,7 @@ const cp = require('node:child_process');
 
 const IS_WIN = process.platform === 'win32';
 const ARGS = (() => {
-  const a = { app: null, out: 'engine-probe', codex: [], opencode: [], only: null };
+  const a = { app: null, out: 'engine-probe', codex: [], opencode: [], claude: [], only: null };
   const v = process.argv.slice(2);
   for (let i = 0; i < v.length; i++) {
     const k = v[i]; const n = v[i + 1];
@@ -32,6 +33,7 @@ const ARGS = (() => {
     else if (k === '--out') { a.out = n; i++; }
     else if (k === '--codex') { a.codex = parsePairs(n); i++; }
     else if (k === '--opencode') { a.opencode = parsePairs(n); i++; }
+    else if (k === '--claude') { a.claude = parsePairs(n); i++; }
     else if (k === '--only') { a.only = n.split(','); i++; }
   }
   return a;
@@ -600,6 +602,225 @@ async function scenarioGate() {
   }
 }
 
+// ---------- claude ----------
+// A real Claude Code pane started exactly like the app's main process does: buildSpawn
+// with the app's identity-file sink (spawnPromptFile.createSink), then the Windows
+// wrapper (engineInstall.execArgs). No login: a FAKE key, pre-approved, so the input box
+// opens; nothing reaches a model. Measured: does the pane live 30 s, what did it print
+// if it died, and does typed text reach its input box.
+const spawnPromptFile = (() => { try { return app('spawnPromptFile.cjs'); } catch { return null; } })();
+const FAKE_ANTHROPIC = 'sk-ant-api03-probe-not-a-real-key-000000000000000000000000';
+function claudeHome(tag, onboarded) {
+  const home = isoHome(`claude-${tag}`);
+  const work = path.join(home, 'work'); fs.mkdirSync(work);
+  if (onboarded) {
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({
+      hasCompletedOnboarding: true, theme: 'dark',
+      customApiKeyResponses: { approved: [FAKE_ANTHROPIC.slice(-20)], rejected: [] },
+    }));
+  }
+  return { home, work };
+}
+// The app reads HOME/USERPROFILE and its data root from ITS OWN process while it builds a
+// pane (trust file, settings/MCP files, identity file): point them at the throwaway home.
+const APP_HOME_KEY = ['AGENT', 'DESK_HOME'].join('');
+function appDataDir(home) { return path.join(home, ['.agent', 'desk'].join('')); }
+function withAppHome(home, fn) {
+  const keys = { USERPROFILE: home, HOME: home, [APP_HOME_KEY]: appDataDir(home) };
+  const saved = Object.keys(keys).map((k) => [k, process.env[k]]);
+  Object.assign(process.env, keys);
+  try { return fn(); } finally { for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+}
+const cleanText = (raw) => raw
+  .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')
+  .replace(/\x1b[P^_][\s\S]*?\x1b\\/g, '')
+  .replace(/\x1b\[[0-9;?<>=!]*[ -\/]*[@-~]/g, '')
+  .replace(/\x1b[()][0-9A-Za-z]/g, '').replace(/\x1b[=>78DEHMc]/g, '')
+  .replace(/sk-ant-[A-Za-z0-9_-]{6,}/g, 'sk-ant-***');
+async function claudeArm(label, dir, arm, opts) {
+  const { home, work } = claudeHome(`${label}-${arm}`, opts.onboarded !== false);
+  const env = envFor(home, dir, { ANTHROPIC_API_KEY: FAKE_ANTHROPIC, DISABLE_AUTOUPDATER: '1', ...(opts.env || {}) });
+  let plan = null; let planErr = null; let sinkInfo = 'none'; let trustOk = null;
+  withAppHome(home, () => {
+    let sink = null;
+    if (opts.sink !== false && spawnPromptFile) {
+      const bin = engineInstall.resolveBinary('claude', env);
+      const t0 = Date.now();
+      let logged = '';
+      sink = spawnPromptFile.createSink({ engine: 'claude', bin, env, home: appDataDir(home), log: (l) => { logged = l.slice(0, 300); } });
+      sinkInfo = `${sink ? 'sink' : 'NO sink'} (${Date.now() - t0} ms) ${logged}`;
+    }
+    try {
+      plan = agentRunner.buildSpawn({ command: 'claude', agentId: `probe-${arm}`, cwd: work, disallowSubagent: true, ...(opts.spawn || {}) },
+        env, ARGS.app, sink ? { promptFile: sink } : {});
+    } catch (e) { planErr = String(e && e.message || e).slice(0, 400); }
+    // main.js does this right after buildSpawn (plan.trust.pending → ensureEngineTrusted).
+    if (plan && plan.trust && plan.trust.pending && opts.trust !== false) trustOk = agentRunner.ensureEngineTrusted(plan.key, plan.cwd, plan.env);
+  });
+  if (!plan) return { plan_error: planErr, sink: sinkInfo };
+  const trustKeys = (() => { try { return Object.keys(JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).projects || {}); } catch { return null; } })();
+  const target = paneTarget(plan);
+  if (!target) return { resolved: null, plan_file: plan.file, sink: sinkInfo };
+  const argvShape = plan.argv.map((a) => (a.startsWith('-') ? a : a.length > 40 ? `<${a.length} ch${/\n/.test(a) ? ', multi-line' : ''}>` : a.replace(/[0-9a-f-]{36}/, '<uuid>')));
+  const cmdLine = typeof target.argv === 'string' ? target.argv : target.argv.join(' ');
+  const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols: 120, rows: 32 });
+  const box = () => /❯|Try "|for shortcuts/.test(liveText(s));
+  await waitFor(() => s.exit || box(), opts.waitMs || 30000, 250);
+  const boxMs = box() ? Date.now() - s.startedAt : null;
+  let typed = null;
+  if (!s.exit && opts.type) {
+    const needle = `probe${Math.random().toString(36).slice(2, 8)}`;
+    s.t.write(`Probe teslim metni ${needle}`);
+    await sleep(2500);
+    typed = { needle, in_box: liveText(s).includes(needle) };
+  }
+  await waitFor(() => s.exit, opts.lingerMs || 8000, 250);
+  dumpActive(s, `claude-${label}-${arm}`);
+  const text = cleanText(s.raw);
+  fs.writeFileSync(path.join(ARGS.out, `claude-${label}-${arm}.text.txt`), `${text.slice(0, 6000)}\n`);
+  const alive = !s.exit;
+  const before = alive ? descendants(s.t.pid) : [];
+  if (alive) treeKill.killPaneTreesSync([s.t]);
+  await waitFor(() => s.exit, 10000);
+  await sleep(1500);
+  const left = stillAlive(before); reap(left);
+  return {
+    sink: sinkInfo, spawn: path.basename(target.file), bin: path.basename(target.bin), argv: argvShape,
+    cmdline_chars: cmdLine.length, cmdline_has_newline: /\n/.test(cmdLine),
+    trust_written: trustOk, trust_keys_before: trustKeys, trust_keys_after: (() => { try { return Object.keys(JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).projects || {}); } catch { return null; } })(),
+    trust_dialog: /trust this folder|Quick safety check|Do you trust/i.test(cleanText(s.raw)),
+    alive, exit: alive ? null : s.exit, bytes: s.bytes, box_ms: boxMs, typed,
+    text_tail: text.replace(/\s+/g, ' ').trim().slice(-700), leftover: left.map((p) => p.name),
+  };
+}
+async function scenarioClaude() {
+  const want = process.env.PROBE_CLAUDE_ARMS ? process.env.PROBE_CLAUDE_ARMS.split(',') : null;
+  const arms = [
+    ['worker', { type: true }],
+    ['worker-nosink', { sink: false, type: true }],
+    ['worker-fresh-home', { onboarded: false }],
+    ['resume-missing', { spawn: { resume: true, sessionId: '11111111-2222-4333-8444-555555555555' } }],
+  ].filter(([a]) => !want || want.includes(a));
+  for (const { label, dir } of ARGS.claude) {
+    for (const [arm, opts] of arms) {
+      let r;
+      try { r = await claudeArm(label, dir, arm, opts); } catch (e) { r = { error: String(e && e.stack || e).slice(0, 1200) }; }
+      // Measured, not judged by the arm: an arm passes when the pane is alive at the end
+      // (and typed text reached the box). A death is the finding.
+      report(`claude-${label}-${arm}`, !!r.alive && (!r.typed || r.typed.in_box), r);
+    }
+  }
+}
+
+// ---------- claudegate ----------
+// The app's delivery gate (engineAwareRunner, window-side code) drives a FRESH Claude Code
+// worker pane built like main.js builds it, and the task text is sent WITH Enter, the way
+// the app sends it. Measured: when the gate decided "ready", what was on screen then,
+// whether the pane survived the Enter, and whether the engine took the text as a turn
+// (with the fake key a taken turn ends in claude's own "invalid API key" answer).
+// Gate bundle: scripts/gate/claude-<build>.cjs (esbuild of engineReadyRunner + paneReadiness).
+async function claudeGateArm(label, dir, arm, opts) {
+  const gate = require(path.join(__dirname, 'gate', `claude-${opts.build}.cjs`));
+  const { home, work } = claudeHome(`g-${label}-${arm}`, true);
+  // Control arm: the warning already accepted the way claude itself stores it (user settings).
+  if (opts.preAccepted) {
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'settings.json'), JSON.stringify({ skipDangerousModePermissionPrompt: true }));
+  }
+  const env = envFor(home, dir, { ANTHROPIC_API_KEY: FAKE_ANTHROPIC, DISABLE_AUTOUPDATER: '1' });
+  let plan = null; let planErr = null; let bypassWritten = null;
+  withAppHome(home, () => {
+    const bin = engineInstall.resolveBinary('claude', env);
+    // Every arm lives what a customer lives: the app's identity-file probe runs `claude -p` in
+    // this home before the pane (its cache is per process, so reset it per arm).
+    if (spawnPromptFile && spawnPromptFile.resetSupportCache) spawnPromptFile.resetSupportCache();
+    const sink = spawnPromptFile ? spawnPromptFile.createSink({ engine: 'claude', bin, env, home: appDataDir(home), log: () => {} }) : null;
+    try {
+      plan = agentRunner.buildSpawn({ command: 'claude', agentId: `probe-g-${arm}`, cwd: work, disallowSubagent: true }, env, ARGS.app, sink ? { promptFile: sink } : {});
+      if (plan.trust && plan.trust.pending) agentRunner.ensureEngineTrusted(plan.key, plan.cwd, plan.env);
+      // The change under test, main side: the trust writer from the branch (verbatim slice of
+      // agentRunner.js, scripts/gate/claude-fix-trust.cjs) runs where main.js runs the app's.
+      if (opts.trustFix) bypassWritten = require(path.join(__dirname, 'gate', 'claude-fix-trust.cjs')).ensureClaudeBypassAccepted(plan.env, home);
+    } catch (e) { planErr = String(e && e.message || e).slice(0, 400); }
+  });
+  if (!plan) return { plan_error: planErr };
+  const target = paneTarget(plan);
+  if (!target) return { resolved: null };
+  const accepted = (() => { try { return JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8')).skipDangerousModePermissionPrompt === true; } catch { return false; } })();
+  let s = null; let tail = '';
+  const writes = []; let screenAtReady = null; const chunks = [];
+  const since = () => (s ? Date.now() - s.startedAt : 0);
+  const api = {
+    async spawn() {
+      s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols: 120, rows: 32 });
+      s.t.onData((d) => { tail = (tail + d).slice(-PANE_BUFFER_MAX); if (since() <= 15000) chunks.push([since(), d]); });
+      return { paneId: 'p1', agentId: `probe-g-${arm}` };
+    },
+    write(_p, data) {
+      if (!writes.length) screenAtReady = liveText(s).split('\n').map((l) => l.trimEnd()).filter(Boolean).slice(-14).join('\n');
+      writes.push({ ms: since(), chars: data.length, enter: data === '\r' });
+      if (!s.exit) s.t.write(data);
+    },
+    async list() { return []; }, async kill() {}, async bind() {},
+    onData() { return () => {}; }, onExit() { return () => {}; },
+    async attach() { return { ok: true, buffer: tail, command: 'claude' }; },
+  };
+  let trace = null;
+  const runner = gate.engineAwareRunner(api, {
+    readPane: async () => tail, verifySubmit: false,
+    onReadyTrace: (_p, t) => { trace = { verdict: t.verdict, waited_ms: t.waitedMs, at_ms: since(), engine: t.engine }; },
+    detectBlocker: gate.detectBlocker, composerReady: gate.composerReady, turnPending: gate.turnPending, readyQuietMs: gate.readyQuietMs,
+  });
+  await runner.spawn({ command: 'claude' });
+  const needle = `mark${Math.random().toString(36).slice(2, 8)}`;
+  runner.write('p1', `Probe teslim metni ${needle}. Yalnız OK yaz.\r`);
+  await waitFor(() => (trace && writes.some((w) => w.enter)) || s.exit, 60000, 250);
+  // After Enter: the pane either dies, shows the text as a sent turn, or answers.
+  await waitFor(() => s.exit || /Invalid API key|API Error|401|authentication|\bOK\b/i.test(cleanText(s.raw).slice(-4000)), opts.answerMs || 25000, 250);
+  await sleep(1500);
+  dumpActive(s, `claudegate-${label}-${arm}`);
+  const text = cleanText(s.raw);
+  fs.writeFileSync(path.join(ARGS.out, `claudegate-${label}-${arm}.text.txt`), `${text.slice(-8000)}\n`);
+  fs.writeFileSync(path.join(ARGS.out, `claudegate-${label}-${arm}.at-ready.txt`), `${screenAtReady || ''}\n`);
+  fs.writeFileSync(path.join(ARGS.out, `claudegate-${label}-${arm}.raw-first-15s.json`), `${JSON.stringify(chunks).replace(/sk-ant-[A-Za-z0-9_-]{6,}/g, 'sk-ant-***')}\n`);
+  const alive = !s.exit;
+  const before = alive ? descendants(s.t.pid) : [];
+  if (alive) treeKill.killPaneTreesSync([s.t]);
+  await waitFor(() => s.exit, 10000);
+  await sleep(1500);
+  const left = stillAlive(before); reap(left);
+  const flat = text.replace(/\s+/g, '');
+  return {
+    build: opts.build, trust_fix: !!opts.trustFix, bypass_written_by_fix: bypassWritten, bypass_accepted_before_spawn: accepted, trace, writes,
+    warning_on_screen_at_ready: /BypassPermissionsmode/i.test((screenAtReady || '').replace(/\s+/g, '')),
+    warning_seen: /BypassPermissionsmode/i.test(text.replace(/\s+/g, '')),
+    exit: s.exit, alive_after_enter: alive, bytes: s.bytes,
+    text_reached_engine: flat.includes(needle) && !/❯No,exit/.test(flat.slice(flat.lastIndexOf(needle))),
+    engine_answered: /Invalid API key|API Error|authentication_error|Please run \/login/i.test(text),
+    tail: text.replace(/\s+/g, ' ').trim().slice(-500), leftover: left.map((p) => p.name),
+  };
+}
+async function scenarioClaudeGate() {
+  const want = process.env.PROBE_CLAUDEGATE_ARMS ? process.env.PROBE_CLAUDEGATE_ARMS.split(',') : null;
+  const arms = [
+    // control arm: today's gate on a first start (warning not accepted yet) — the defect
+    ['base', { build: 'base' }, (r) => r.exit && r.exit.code !== 0 && !r.engine_answered],
+    // the same gate, warning already accepted in claude's config — isolates the cause
+    ['base-accepted', { build: 'base', preAccepted: true }, (r) => r.alive_after_enter && r.engine_answered],
+    // the change under test: branch trust writer + branch gate
+    ['fix', { build: 'fix', trustFix: true }, (r) => r.alive_after_enter && r.engine_answered && !r.warning_seen],
+    // second layer alone (warning NOT accepted): the gate must not type, the pane must live
+    ['fix-gate-only', { build: 'fix' }, (r) => r.alive_after_enter && r.writes.length === 0 && r.trace && r.trace.verdict === 'blocked'],
+  ].filter(([a, o]) => (!want || want.includes(a)) && fs.existsSync(path.join(__dirname, 'gate', `claude-${o.build}.cjs`)));
+  for (const { label, dir } of ARGS.claude) {
+    for (const [arm, opts, expect] of arms) {
+      let r;
+      try { r = await claudeGateArm(label, dir, arm, opts); } catch (e) { r = { error: String(e && e.stack || e).slice(0, 1200) }; }
+      report(`claudegate-${label}-${arm}`, !r.error && !!expect(r), { expect: expect.toString().replace(/\s+/g, ' ').slice(5), ...r });
+    }
+  }
+}
+
 function versionOf(binDir) {
   try {
     const pkg = path.join(binDir, IS_WIN ? '' : '..', 'lib', 'node_modules', 'opencode-ai', 'package.json');
@@ -611,7 +832,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['gate', scenarioGate]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['gate', scenarioGate], ['claude', scenarioClaude], ['claudegate', scenarioClaudeGate]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
