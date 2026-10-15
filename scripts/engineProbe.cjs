@@ -722,10 +722,15 @@ async function scenarioClaude() {
 async function claudeGateArm(label, dir, arm, opts) {
   const gate = require(path.join(__dirname, 'gate', `claude-${opts.build}.cjs`));
   const { home, work } = claudeHome(`g-${label}-${arm}`, true);
-  // Control arm: the warning already accepted the way claude itself stores it (user settings).
+  // Control arm: both start-up dialogs already accepted the way claude itself stores them:
+  // warning in user settings, folder trust under claude's own key (forward slashes on Windows).
   if (opts.preAccepted) {
     fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
     fs.writeFileSync(path.join(home, '.claude', 'settings.json'), JSON.stringify({ skipDangerousModePermissionPrompt: true }));
+    const f = path.join(home, '.claude.json');
+    const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+    const key = fs.realpathSync(work).normalize('NFC').replace(/\\/g, IS_WIN ? '/' : '\\');
+    fs.writeFileSync(f, JSON.stringify({ ...cfg, projects: { [key]: { hasTrustDialogAccepted: true } } }));
   }
   const env = envFor(home, dir, { ANTHROPIC_API_KEY: FAKE_ANTHROPIC, DISABLE_AUTOUPDATER: '1' });
   let plan = null; let planErr = null; let bypassWritten = null;
@@ -740,7 +745,11 @@ async function claudeGateArm(label, dir, arm, opts) {
       if (plan.trust && plan.trust.pending) agentRunner.ensureEngineTrusted(plan.key, plan.cwd, plan.env);
       // The change under test, main side: the trust writer from the branch (verbatim slice of
       // agentRunner.js, scripts/gate/claude-fix-trust.cjs) runs where main.js runs the app's.
-      if (opts.trustFix) bypassWritten = require(path.join(__dirname, 'gate', 'claude-fix-trust.cjs')).ensureClaudeBypassAccepted(plan.env, home);
+      if (opts.trustFix) {
+        const fixMain = require(path.join(__dirname, 'gate', 'claude-fix-trust.cjs'));
+        bypassWritten = fixMain.ensureClaudeBypassAccepted(plan.env, home);
+        fixMain.ensureClaudeTrusted(plan.cwd, home);
+      }
     } catch (e) { planErr = String(e && e.message || e).slice(0, 400); }
   });
   if (!plan) return { plan_error: planErr };
@@ -794,6 +803,8 @@ async function claudeGateArm(label, dir, arm, opts) {
     build: opts.build, trust_fix: !!opts.trustFix, bypass_written_by_fix: bypassWritten, bypass_accepted_before_spawn: accepted, trace, writes,
     warning_on_screen_at_ready: /BypassPermissionsmode/i.test((screenAtReady || '').replace(/\s+/g, '')),
     warning_seen: /BypassPermissionsmode/i.test(text.replace(/\s+/g, '')),
+    trust_dialog_seen: /Quicksafetycheck|trustthisfolder/i.test(text.replace(/\s+/g, '')),
+    trust_keys: (() => { try { return Object.keys(JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).projects || {}).map((k) => k.replace(/asprobe-[^\\/]+/, '<home>')); } catch { return null; } })(),
     exit: s.exit, alive_after_enter: alive, bytes: s.bytes,
     text_reached_engine: flat.includes(needle) && !/❯No,exit/.test(flat.slice(flat.lastIndexOf(needle))),
     engine_answered: /Invalid API key|API Error|authentication_error|Please run \/login/i.test(text),
@@ -808,7 +819,7 @@ async function scenarioClaudeGate() {
     // the same gate, warning already accepted in claude's config — isolates the cause
     ['base-accepted', { build: 'base', preAccepted: true }, (r) => r.alive_after_enter && r.engine_answered],
     // the change under test: branch trust writer + branch gate
-    ['fix', { build: 'fix', trustFix: true }, (r) => r.alive_after_enter && r.engine_answered && !r.warning_seen],
+    ['fix', { build: 'fix', trustFix: true }, (r) => r.alive_after_enter && r.engine_answered && !r.warning_seen && !r.trust_dialog_seen],
     // second layer alone (warning NOT accepted): the gate must not type, the pane must live
     ['fix-gate-only', { build: 'fix' }, (r) => r.alive_after_enter && r.writes.length === 0 && r.trace && r.trace.verdict === 'blocked'],
   ].filter(([a, o]) => (!want || want.includes(a)) && fs.existsSync(path.join(__dirname, 'gate', `claude-${o.build}.cjs`)));
