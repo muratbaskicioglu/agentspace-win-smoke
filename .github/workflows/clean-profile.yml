@@ -1,0 +1,199 @@
+# Clean-profile first run of a PUBLISHED AgentSpace release, on macOS 15 / 26 / 27 (preview),
+# macOS 15 Intel, Windows 11 Arm and Windows Server 2025.
+#
+# Every job starts on a fresh GitHub-hosted runner (nothing of AgentSpace on it), downloads
+# the release file from agentspace-releases, checks its sha256, then:
+#   install -> first launch up to the sign-in screen -> close -> uninstall
+# with a frame of every window step. It also runs two checks with the installed app's own
+# modules (scripts/appProbe.cjs): the Antigravity hook command and the memory brake.
+#
+# The release script in the app repo dispatches this workflow before a release becomes
+# "Latest" (scripts/release/clean_profile_gate.cjs). An empty mac_x64_sha256 / win_sha256
+# skips that platform (for a macOS-only release); the arm64 dmg is always tested.
+#
+# REPO RULE: no app source code and no unreleased build ever goes into this repo.
+# Only a PUBLISHED installer (downloaded, sha256 checked) + test scripts.
+#
+# Security notes (same rules as smoke.yml):
+# - Manual trigger only. No push / pull_request / schedule triggers.
+# - No secrets, no account: the app stops at its sign-in screen.
+# - Inputs reach the shell only through env vars and are checked against strict patterns.
+# - Release repo is fixed. Actions are pinned to full commit SHAs. Read-only token.
+# - Standard runners only (free on a public repo). No -large / -xlarge labels.
+name: clean profile first run
+
+run-name: clean profile ${{ inputs.tag }} ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag in agentspace-releases (e.g. v0.4.8)'
+        required: true
+        type: string
+      version:
+        description: 'Version in the file names (empty = tag without the leading v)'
+        required: false
+        type: string
+        default: ''
+      mac_arm64_sha256:
+        description: 'sha256 of AgentSpace-<version>-arm64.dmg'
+        required: true
+        type: string
+      mac_x64_sha256:
+        description: 'sha256 of AgentSpace-<version>-x64.dmg (empty = skip macOS Intel)'
+        required: false
+        type: string
+        default: ''
+      win_sha256:
+        description: 'sha256 of AgentSpace-Setup-<version>.exe (empty = skip Windows)'
+        required: false
+        type: string
+        default: ''
+      request_id:
+        description: 'Shown in the run name only, so the caller can find its run (not used by any step)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-profile-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  mac:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15-intel (x64) only when the release has an Intel dmg.
+        runner: ${{ fromJSON(inputs.mac_x64_sha256 != '' && '["macos-15","macos-26","xcode-27","macos-15-intel"]' || '["macos-15","macos-26","xcode-27"]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: download dmg + check sha256
+        env:
+          SMOKE_TAG: ${{ inputs.tag }}
+          SMOKE_VERSION: ${{ inputs.version }}
+          SMOKE_RUNNER: ${{ matrix.runner }}
+          SHA_ARM64: ${{ inputs.mac_arm64_sha256 }}
+          SHA_X64: ${{ inputs.mac_x64_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SMOKE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "::error::bad tag"; exit 1; }
+          ver="${SMOKE_VERSION:-${SMOKE_TAG#v}}"
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "::error::bad version"; exit 1; }
+          case "$SMOKE_RUNNER" in macos-15-intel) arch=x64; want="$SHA_X64" ;; *) arch=arm64; want="$SHA_ARM64" ;; esac
+          want="$(printf '%s' "$want" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256"; exit 1; }
+          asset="AgentSpace-${ver}-${arch}.dmg"
+          mkdir -p smoke-input
+          curl -fsSL --retry 3 -o "smoke-input/$asset" \
+            "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$SMOKE_TAG/$asset"
+          got="$(shasum -a 256 "smoke-input/$asset" | cut -d' ' -f1)"
+          echo "$got  $(stat -f %z "smoke-input/$asset")  $asset"
+          [[ "$got" == "$want" ]] || { echo "::error::sha256 mismatch: expected $want, got $got"; exit 1; }
+          echo "| $asset | \`$got\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: install, first launch, close, uninstall
+        run: bash scripts/macSmoke.sh "$(ls smoke-input/*.dmg | head -1)" clean-profile-mac
+
+      - name: upload evidence (frames, json, app log)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clean-profile-${{ matrix.runner }}-${{ github.run_id }}
+          path: clean-profile-mac
+          if-no-files-found: warn
+          retention-days: 7
+
+  windows:
+    name: ${{ matrix.runner }}
+    if: ${{ inputs.win_sha256 != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-11-arm, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: download installer + check sha256
+        env:
+          SMOKE_TAG: ${{ inputs.tag }}
+          SMOKE_VERSION: ${{ inputs.version }}
+          SMOKE_SHA256: ${{ inputs.win_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SMOKE_TAG -cnotmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Write-Host "::error::bad tag"; exit 1 }
+          $ver = if ($env:SMOKE_VERSION) { $env:SMOKE_VERSION } else { $env:SMOKE_TAG.Substring(1) }
+          if ($ver -cnotmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Write-Host "::error::bad version"; exit 1 }
+          $want = $env:SMOKE_SHA256.Trim().ToLower()
+          if ($want -cnotmatch '^[0-9a-f]{64}$') { Write-Host "::error::bad sha256"; exit 1 }
+          $asset = "AgentSpace-Setup-$ver.exe"
+          $url = "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$($env:SMOKE_TAG)/$asset"
+          New-Item -ItemType Directory -Force -Path smoke-input | Out-Null
+          $dst = Join-Path 'smoke-input' $asset
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          $got = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          "$got  $((Get-Item $dst).Length)  $asset"
+          if ($got -ne $want) { Write-Host "::error::sha256 mismatch: expected $want, got $got"; exit 1 }
+          "| $asset | ``$got`` |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          "OS: $((Get-CimInstance Win32_OperatingSystem).Caption) $([System.Environment]::OSVersion.Version) $env:PROCESSOR_ARCHITECTURE, RAM $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)) GB" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: install, launch probe, first launch, close
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/installSmoke.ps1 -Dist smoke-input -OutDir clean-profile-win
+
+      - name: app's own modules (Antigravity hook, memory brake)
+        if: ${{ !cancelled() }}
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\agentdesk-shell\AgentSpace.exe'
+          if (-not (Test-Path $exe)) {
+            $exe = (Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Depth 2 -Filter 'AgentSpace.exe' -File | Select-Object -First 1).FullName
+          }
+          if (-not $exe) { Write-Host "::error::installed AgentSpace.exe not found"; exit 2 }
+          $asar = Join-Path (Split-Path $exe) 'resources\app.asar'
+          $out = Join-Path $PWD 'clean-profile-win'
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          $p = Start-Process -FilePath $exe -ArgumentList @('scripts/appProbe.cjs', '--app', "`"$asar`"", '--out', "`"$out`"", '--label', 'win') `
+            -NoNewWindow -PassThru -Wait -RedirectStandardOutput (Join-Path $out 'app-probe-stdout.txt') -RedirectStandardError (Join-Path $out 'app-probe-stderr.txt')
+          Get-Content (Join-Path $out 'app-probe-stdout.txt')
+          Get-Content (Join-Path $out 'app-probe-stderr.txt') -ErrorAction SilentlyContinue | Select-Object -Last 20
+          Get-Content (Join-Path $out 'app-probe-stdout.txt') | ForEach-Object { "- $_" } | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          "app probe exit $($p.ExitCode)"
+          exit $p.ExitCode
+
+      - name: uninstall
+        if: ${{ !cancelled() }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/uninstallSmoke.ps1 -OutDir clean-profile-win-uninstall
+
+      - name: upload evidence (frames, json)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clean-profile-${{ matrix.runner }}-${{ github.run_id }}
+          path: |
+            clean-profile-win
+            clean-profile-win-uninstall
+          if-no-files-found: warn
+          retention-days: 7
