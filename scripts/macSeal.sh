@@ -6,8 +6,10 @@
 #
 #   install (dmg -> /Applications) -> seal 0 -> launch like a double-click -> walk every
 #   page in the app window (scripts/sealNav.cjs) -> close -> seal 1 -> launch again ->
-#   close -> seal 2 -> Gatekeeper reaction: launch with no quarantine flag, then with the
-#   quarantine flag a browser download carries -> frames of every window that shows up.
+#   close -> seal 2 -> Gatekeeper reaction: launch with no quarantine flag, with the flag
+#   of a download the user already opened once (01c1, "user approved" bit 0x40 set: the
+#   state of an installed customer copy), then with the flag of a fresh browser download
+#   (0081, not approved) -> frames of every window that shows up.
 #
 # Arm "emulated-fix": the same walk with the Next.js disk cache turned off in the installed
 # copy (isrFlushToDisk true -> false, the one config value the fix changes; this repo never
@@ -207,6 +209,20 @@ launch_watch relaunch-no-quarantine 02-relaunch; R1_APP=$LW_APP; R1_DIALOG=$LW_D
 close_app close2
 seal seal2; S2_CS=$SEAL_CS; S2_RC=$SEAL_RC
 
+# ── 3b. Gatekeeper reaction: quarantine flag the user already approved ───
+# 01c1 is what a downloaded app carries after its first approved launch (read from apps
+# installed on a real Mac). Runs before the unapproved flag so no rejection is cached yet.
+R3_APP=-; R3_DIALOG=-
+if [[ "$ARM" == published ]]; then
+  xattr -w com.apple.quarantine "01c1;$(printf '%x' "$(date +%s)");Chrome;" "$APP"
+  gk="$(spctl --assess --type execute -vv "$APP" 2>&1 | tr '\n' ' ')"
+  step gatekeeper-approved-flag info "flag $(xattr -p com.apple.quarantine "$APP") · spctl: $gk"
+  launch_watch launch-approved 02b-approved; R3_APP=$LW_APP; R3_DIALOG=$LW_DIALOG
+  close_app close2b
+  pkill -x CoreServicesUIAgent 2>/dev/null || true
+  xattr -dr com.apple.quarantine "$APP"
+fi
+
 # ── 4. Gatekeeper reaction: same bundle with the quarantine flag (as a browser download) ──
 R2_APP=-; R2_DIALOG=-
 if [[ "$ARM" == published ]]; then
@@ -231,7 +247,7 @@ else
   [[ $BROKEN -eq 0 && $S2_CS -eq 0 && "$S2_RC" == 0 ]] && step expectation pass "seal clean after walk + close + relaunch (codesign rc=$S1_CS/$S2_CS, route-cache $S1_RC/$S2_RC, added $S1_ADDED)" \
                       || step expectation fail "seal broken (codesign rc=$S1_CS/$S2_CS, route-cache $S1_RC/$S2_RC, added $S1_ADDED)"
 fi
-step gatekeeper-reaction info "relaunch without quarantine: app window $R1_APP, dialog $R1_DIALOG · with quarantine: app window $R2_APP, dialog $R2_DIALOG"
+step gatekeeper-reaction info "relaunch without quarantine: app window $R1_APP, dialog $R1_DIALOG · approved quarantine (01c1): app window $R3_APP, dialog $R3_DIALOG · fresh quarantine (0081): app window $R2_APP, dialog $R2_DIALOG"
 
 V=green; RC=0
 [[ $UNMEASURED -eq 1 ]] && { V=unmeasured; RC=2; }
