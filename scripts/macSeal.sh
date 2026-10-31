@@ -9,6 +9,12 @@
 #   close -> seal 2 -> Gatekeeper reaction: launch with no quarantine flag, then with the
 #   quarantine flag a browser download carries -> frames of every window that shows up.
 #
+# Arm "emulated-fix": the same walk with the Next.js disk cache turned off in the installed
+# copy (isrFlushToDisk true -> false, the one config value the fix changes; this repo never
+# holds unreleased builds). The edit breaks the Developer ID signature, so the copy is
+# re-signed ad hoc first: codesign must then stay clean through the walk. spctl rejects an
+# ad-hoc copy by design, so this arm has no Gatekeeper section.
+#
 # A "seal" is: codesign --verify --deep --strict, spctl --assess, files newer than
 # the signature, the Next.js route-cache folder inside the bundle, and a full file list
 # (diffed against seal 0).
@@ -18,15 +24,16 @@
 # --expect intact : green when the bundle is byte-for-byte the same after the walk.
 #
 # ⛔ Runs ONLY on a throwaway GitHub-hosted runner (it installs into /Applications).
-# Usage: bash scripts/macSeal.sh <AgentSpace-x.y.z-arch.dmg> <out dir> <broken|intact>
+# Usage: bash scripts/macSeal.sh <AgentSpace-x.y.z-arch.dmg> <out dir> <broken|intact> [published|emulated-fix]
 # Exit:  0 green · 1 red · 2 not measured
 set -uo pipefail
 
-DMG="${1:-}"; OUT="${2:-mac-seal}"; EXPECT="${3:-}"
+DMG="${1:-}"; OUT="${2:-mac-seal}"; EXPECT="${3:-}"; ARM="${4:-published}"
 if [[ "${GITHUB_ACTIONS:-}" != "true" || "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then
   echo "refusing: this script only runs on a throwaway GitHub-hosted runner" >&2; exit 2
 fi
-[[ -f "$DMG" && ( "$EXPECT" == broken || "$EXPECT" == intact ) ]] || { echo "usage: macSeal.sh <dmg> <out dir> <broken|intact>" >&2; exit 2; }
+[[ -f "$DMG" && ( "$EXPECT" == broken || "$EXPECT" == intact ) && ( "$ARM" == published || "$ARM" == emulated-fix ) ]] || { echo "usage: macSeal.sh <dmg> <out dir> <broken|intact> [published|emulated-fix]" >&2; exit 2; }
+WANT="$EXPECT"; [[ "$ARM" == emulated-fix ]] && WANT=intact
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$OUT/frames" "$OUT/seal" "$OUT/logs"
@@ -78,6 +85,7 @@ frame() { # frame <file> <owner names or pids>: biggest on-screen window of that
   echo "screencapture failed"; return 1
 }
 windows_now() { [[ -n "$WINLIST" ]] && "$WINLIST" | awk -F'\t' '{print $5" "$4" (layer "$3")"}' | sort | uniq -c | tr -s ' ' | tr '\n' ';'; }
+limit() { perl -e '$t = shift; alarm $t; exec @ARGV or exit 127' "$@"; } # limit <seconds> <cmd...>: SIGALRM after the limit
 app_pids() { pgrep -f "^$APP/" 2>/dev/null | tr '\n' ' '; }
 main_pid() { pgrep -f "^$APP/Contents/MacOS/[^/]*( |$)" 2>/dev/null | head -1; }
 
@@ -99,6 +107,7 @@ seal() { # seal <label>: codesign + spctl + newer-than-signature + route-cache +
 
 close_app() { # close_app <label>: Cmd-Q as an Apple event, SIGTERM if it does not take
   local how="quit (Apple event)"
+  [[ -z "$(app_pids)" ]] && { step "$1" pass "app was not running"; return 0; }
   osascript -e 'tell application id "com.muratify.agentspace" to quit' >/dev/null 2>&1 & local q=$!
   for _ in $(seq 1 15); do kill -0 "$q" 2>/dev/null || break; sleep 1; done
   kill "$q" 2>/dev/null; wait "$q" 2>/dev/null
@@ -113,8 +122,10 @@ gk_log() { # gk_log <file>: what syspolicyd / CoreServicesUIAgent said about the
 }
 
 launch_watch() { # launch_watch <label> <frame prefix>: open like a double-click, wait, record what shows up
-  local l="$1" fp="$2" t0 win="" ui=""
-  t0=$(date +%s); open "$APP" 2>"$OUT/logs/$l.open.txt"; local orc=$?
+  # `open` runs in the background: with a Gatekeeper dialog up it does not return until the
+  # dialog is answered (run 1 waited 27 min), so "open still waiting" is itself a finding.
+  local l="$1" fp="$2" t0 win="" ui="" opid orc
+  t0=$(date +%s); open "$APP" 2>"$OUT/logs/$l.open.txt" & opid=$!
   for _ in $(seq 1 20); do
     sleep 2
     local p; p="$(app_pids)"
@@ -126,8 +137,12 @@ launch_watch() { # launch_watch <label> <frame prefix>: open like a double-click
   local f1="" f2="" n
   [[ -n "$(app_pids)" ]] && f1="$(frame "$OUT/frames/$fp-app.png" "$(app_pids)")"; [[ -n "$f1" ]] && echo "frame: $f1"
   f2="$(frame "$OUT/frames/$fp-gatekeeper-dialog.png" "CoreServicesUIAgent")" || f2=""
+  screencapture -x "$OUT/frames/$fp-screen.png" 2>/dev/null || true
+  if kill -0 "$opid" 2>/dev/null; then
+    orc="still waiting after $(( $(date +%s) - t0 ))s (stopped)"; kill "$opid" 2>/dev/null; wait "$opid" 2>/dev/null
+  else wait "$opid"; orc="rc=$?"; fi
   n="$(gk_log "$OUT/logs/$l.syspolicy.txt")"
-  step "$l" info "open rc=$orc · app processes: $( [[ -n "$(app_pids)" ]] && echo up || echo none ) · app window: $( [[ -n "$win" ]] && echo yes || echo no ) · Gatekeeper dialog (CoreServicesUIAgent): $( [[ -n "$f2" ]] && echo "YES $f2" || echo no ) · syspolicy log lines $n · on screen: $(windows_now) · $(( $(date +%s) - t0 ))s"
+  step "$l" info "open $orc · app processes: $( [[ -n "$(app_pids)" ]] && echo up || echo none ) · app window: $( [[ -n "$win" ]] && echo yes || echo no ) · Gatekeeper dialog (CoreServicesUIAgent): $( [[ -n "$f2" ]] && echo "YES $f2" || echo no ) · syspolicy log lines $n · on screen: $(windows_now) · $(( $(date +%s) - t0 ))s"
   LW_APP=$( [[ -n "$win" ]] && echo yes || echo no ); LW_DIALOG=$( [[ -n "$f2" ]] && echo yes || echo no )
 }
 
@@ -147,21 +162,40 @@ SRV="$APP/Contents/Resources/standalone/.next/server"
 NODE=(node); v="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
 if (( v < 22 )); then NODE=(env ELECTRON_RUN_AS_NODE=1 "$BIN"); fi
 
+# ── 0b. arm emulated-fix: Next.js disk cache off + ad-hoc re-sign ───────────
+FLAG_FILES=("$APP/Contents/Resources/standalone/server.js" "$APP/Contents/Resources/standalone/.next/required-server-files.json")
+fl=""; for f in "${FLAG_FILES[@]}"; do
+  [[ -f "$f" ]] || { step flag unmeasured "missing ${f#$APP/}"; exit 2; }
+  fl+="${f#$APP/Contents/Resources/}: true $(grep -oE '"isrFlushToDisk": *true' "$f" | wc -l | tr -d ' '), false $(grep -oE '"isrFlushToDisk": *false' "$f" | wc -l | tr -d ' ') · "
+done
+step flag info "published: $fl"
+if [[ "$ARM" == emulated-fix ]]; then
+  for f in "${FLAG_FILES[@]}"; do
+    [[ "$(grep -oE '"isrFlushToDisk": *true' "$f" | wc -l | tr -d ' ')" == 1 ]] || { step flag unmeasured "expected exactly one \"isrFlushToDisk\": true in ${f#$APP/}"; exit 2; }
+    perl -pi -e 's/("isrFlushToDisk":\s*)true/${1}false/' "$f"
+  done
+  fl=""; for f in "${FLAG_FILES[@]}"; do fl+="${f#$APP/Contents/Resources/}: false $(grep -oE '"isrFlushToDisk": *false' "$f" | wc -l | tr -d ' ') · "; done
+  rs="$(codesign --force --deep --sign - --timestamp=none "$APP" 2>&1 | tail -1)"; rsrc=$?
+  step emulated-fix info "flag turned off ($fl) and re-signed ad hoc (rc=$rsrc $rs)"
+fi
+
 # ── 1. seal before anything ran ─────────────────────────────────────────
 seal seal0; S0_CS=$SEAL_CS; S0_GK=$SEAL_GK
-xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" "$APP"
-gk="$(spctl --assess --type execute -vv "$APP" 2>&1 | tr '\n' ' ')"; step gatekeeper-quarantined-before info "$gk"
-xattr -dr com.apple.quarantine "$APP"
+if [[ "$ARM" == published ]]; then
+  xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" "$APP"
+  gk="$(spctl --assess --type execute -vv "$APP" 2>&1 | tr '\n' ' ')"; step gatekeeper-quarantined-before info "$gk"
+  xattr -dr com.apple.quarantine "$APP"
+fi
 
 # ── 2. launch like a double-click, walk every page in the app window, close ──
-open "$APP" --args "--remote-debugging-port=$CDP" 2>"$OUT/logs/launch1.open.txt"
+limit 60 open "$APP" --args "--remote-debugging-port=$CDP" 2>"$OUT/logs/launch1.open.txt"
 up=""; for _ in $(seq 1 45); do sleep 2; curl -fsS "http://127.0.0.1:$CDP/json/version" >/dev/null 2>&1 && { up=1; break; }; done
 if [[ -z "$up" ]]; then step launch1 unmeasured "devtools port $CDP not up in 90 s ($(app_pids))"
 else
   step launch1 pass "app up, devtools port open"
   sleep 8
   f="$(frame "$OUT/frames/01-launch1-app.png" "$(app_pids)")"; step launch1-frame info "$f"
-  w="$("${NODE[@]}" "$HERE/sealNav.cjs" --server "$SRV" --cdp "$CDP" --out "$OUT/walk1.json" --frames "$OUT/frames/walk1" 2>&1)"; wrc=$?
+  w="$(limit 600 "${NODE[@]}" "$HERE/sealNav.cjs" --server "$SRV" --cdp "$CDP" --out "$OUT/walk1.json" --frames "$OUT/frames/walk1" 2>&1)"; wrc=$?
   [[ $wrc -eq 0 ]] && step walk1 pass "${w//$'\n'/ }" || step walk1 unmeasured "rc=$wrc ${w//$'\n'/ }"
   step walk1-route-cache info "route-cache files while the app runs: $( [[ -d "$RC_DIR" ]] && find "$RC_DIR" -type f | wc -l | tr -d ' ' || echo 0 )"
 fi
@@ -174,18 +208,23 @@ close_app close2
 seal seal2; S2_CS=$SEAL_CS; S2_RC=$SEAL_RC
 
 # ── 4. Gatekeeper reaction: same bundle with the quarantine flag (as a browser download) ──
-xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" "$APP"
-gk="$(spctl --assess --type execute -vv "$APP" 2>&1 | tr '\n' ' ')"; step gatekeeper-quarantined-after info "$gk"
-launch_watch launch-quarantined 03-quarantined; R2_APP=$LW_APP; R2_DIALOG=$LW_DIALOG
-close_app close3
-pkill -x CoreServicesUIAgent 2>/dev/null || true
-xattr -dr com.apple.quarantine "$APP"
+R2_APP=-; R2_DIALOG=-
+if [[ "$ARM" == published ]]; then
+  xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" "$APP"
+  gk="$(spctl --assess --type execute -vv "$APP" 2>&1 | tr '\n' ' ')"; step gatekeeper-quarantined-after info "$gk"
+  launch_watch launch-quarantined 03-quarantined; R2_APP=$LW_APP; R2_DIALOG=$LW_DIALOG
+  close_app close3
+  pkill -x CoreServicesUIAgent 2>/dev/null || true
+  xattr -dr com.apple.quarantine "$APP"
+fi
 
 # ── verdict ─────────────────────────────────────────────────────────────
-if [[ $S0_CS -ne 0 || $S0_GK -ne 0 ]]; then step seal0-clean fail "the installed release was not clean before it ran (codesign rc=$S0_CS, spctl rc=$S0_GK)"
+if [[ "$ARM" == emulated-fix ]]; then
+  [[ $S0_CS -ne 0 ]] && step seal0-clean fail "the ad-hoc copy was not clean before it ran (codesign rc=$S0_CS)" || step seal0-clean pass "codesign clean before the first launch (ad hoc; spctl rc=$S0_GK, an ad-hoc copy is rejected by design)"
+elif [[ $S0_CS -ne 0 || $S0_GK -ne 0 ]]; then step seal0-clean fail "the installed release was not clean before it ran (codesign rc=$S0_CS, spctl rc=$S0_GK)"
 else step seal0-clean pass "codesign and spctl clean before the first launch"; fi
 BROKEN=0; [[ $S1_CS -ne 0 || "$S1_RC" != 0 || ( "$S1_ADDED" != - && "$S1_ADDED" != 0 ) ]] && BROKEN=1
-if [[ "$EXPECT" == broken ]]; then
+if [[ "$WANT" == broken ]]; then
   [[ $BROKEN -eq 1 ]] && step expectation pass "control arm: the walk broke the seal (codesign rc=$S1_CS, route-cache $S1_RC, added $S1_ADDED)" \
                       || step expectation fail "control arm: the seal is still clean after the walk, so this measurement cannot see the bug"
 else
@@ -197,17 +236,17 @@ step gatekeeper-reaction info "relaunch without quarantine: app window $R1_APP, 
 V=green; RC=0
 [[ $UNMEASURED -eq 1 ]] && { V=unmeasured; RC=2; }
 [[ $RED -eq 1 ]] && { V=red; RC=1; }
-python3 -I - "$STEPS" "$OUT/mac-seal.json" "$V" "$EXPECT" <<'PY'
+python3 -I - "$STEPS" "$OUT/mac-seal.json" "$V" "$WANT" "$ARM" <<'PY'
 import json, sys
 steps = []
 for line in open(sys.argv[1], encoding='utf-8'):
     name, status, detail = (line.rstrip('\n').split('\t') + ['', ''])[:3]
     steps.append({'step': name, 'status': status, 'detail': detail})
-json.dump({'verdict': sys.argv[3], 'expect': sys.argv[4], 'steps': steps}, open(sys.argv[2], 'w'), indent=2)
+json.dump({'verdict': sys.argv[3], 'expect': sys.argv[4], 'arm': sys.argv[5], 'steps': steps}, open(sys.argv[2], 'w'), indent=2)
 PY
 echo "verdict: $V"
 {
-  echo "### seal · macOS $(sw_vers -productVersion) $(uname -m) · expect $EXPECT — $V"
+  echo "### seal · macOS $(sw_vers -productVersion) $(uname -m) · arm $ARM · expect $WANT — $V"
   echo
   echo "| step | status | detail |"
   echo "|---|---|---|"

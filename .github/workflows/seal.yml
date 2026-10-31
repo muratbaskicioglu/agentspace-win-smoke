@@ -9,7 +9,9 @@
 # agentspace-releases and checks its sha256. Then:
 #   macOS:   install -> seal (codesign, spctl, files newer than the signature, file list)
 #            -> launch -> walk every page in the app window (scripts/sealNav.cjs) -> close
-#            -> seal -> relaunch -> seal -> launch with the quarantine flag -> frames
+#            -> seal -> relaunch -> seal -> launch with the quarantine flag -> frames.
+#            Arm "emulated-fix" (expect broken only): the same walk with the Next.js disk
+#            cache turned off in the installed copy, re-signed ad hoc (no Gatekeeper part).
 #   Windows: install -> read-only copy (proved read-only) -> launch + walk + close from the
 #            normal folder and twice from the read-only copy -> file diff + output search
 #            for write errors. Arm "emulated-fix" runs the same with the Next.js disk cache
@@ -75,14 +77,15 @@ concurrency:
 
 jobs:
   mac:
-    name: ${{ matrix.runner }}
+    name: ${{ matrix.runner }} ${{ matrix.arm }}
     if: ${{ inputs.mac_arm64_sha256 != '' }}
     strategy:
       fail-fast: false
       matrix:
         runner: [macos-15, macos-26]
+        arm: ${{ fromJSON(inputs.expect == 'broken' && '["published","emulated-fix"]' || '["published"]') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:
@@ -114,16 +117,18 @@ jobs:
 
       - name: install, seal, walk, close, seal, relaunch, quarantine
         env:
+          SEAL_ARM: ${{ matrix.arm }}
           SEAL_EXPECT: ${{ inputs.expect }}
         run: |
           [[ "$SEAL_EXPECT" == broken || "$SEAL_EXPECT" == intact ]] || { echo "::error::bad expect"; exit 1; }
-          bash scripts/macSeal.sh "$(ls seal-input/*.dmg | head -1)" seal-mac "$SEAL_EXPECT"
+          [[ "$SEAL_ARM" == published || "$SEAL_ARM" == emulated-fix ]] || { echo "::error::bad arm"; exit 1; }
+          bash scripts/macSeal.sh "$(find seal-input -maxdepth 1 -name '*.dmg' | head -1)" seal-mac "$SEAL_EXPECT" "$SEAL_ARM"
 
       - name: upload evidence (frames, seal files, json)
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: seal-${{ matrix.runner }}-${{ github.run_id }}
+          name: seal-${{ matrix.runner }}-${{ matrix.arm }}-${{ github.run_id }}
           path: seal-mac
           if-no-files-found: warn
           retention-days: 7

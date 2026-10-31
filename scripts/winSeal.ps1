@@ -7,8 +7,9 @@
 #   -> arm "emulated-fix": turn the Next.js disk cache off in the installed copy
 #      (isrFlushToDisk true -> false, the same one-line change the fix makes; this repo
 #      never holds unreleased builds, so the fix is emulated on the published build)
-#   -> copy the install to C:\Program Files\AgentSpace and make it read-only (Everyone
-#      read+execute only) and PROVE it: a test write into it must be refused
+#   -> copy the install to C:\Program Files\AgentSpace (it keeps the Program Files ACL), deny
+#      new files, new folders, overwrite and delete to Everyone (admins included), and PROVE
+#      it: a test write, a new folder and an open-for-write of an existing file must be refused
 #   A) per-user folder (writable, the real customer layout): launch -> walk every page in
 #      the app window (scripts/sealNav.cjs) -> close -> diff the folder
 #   B) read-only folder: launch with the Next.js cache debug log on -> walk -> close ->
@@ -145,11 +146,17 @@ function Invoke-Run([string]$exe, [string]$tag, [hashtable]$extraEnv) {
   foreach ($k in $extraEnv.Keys) { $vars[$k] = $extraEnv[$k] }
   $bak = @{}; foreach ($k in $vars.Keys) { $bak[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $vars[$k]) }
   $logSizes = Get-AppLogFiles $iso
+  $p = $null; $startErr = $null
   try {
     $p = Start-Process -FilePath $exe -ArgumentList @("--user-data-dir=`"$($iso.udd)`"", "--remote-debugging-port=$Cdp") -PassThru `
       -RedirectStandardOutput (Join-Path $OutFull "$tag.stdout.log") -RedirectStandardError (Join-Path $OutFull "$tag.stderr.log")
+  } catch {
+    $e = $_.Exception; $startErr = "$($e.GetType().Name): $($e.Message)"
+    if ($e.InnerException) { $startErr += " / $($e.InnerException.GetType().Name): $($e.InnerException.Message)" }
+    if ($e.PSObject.Properties['NativeErrorCode']) { $startErr += " (win32 $($e.NativeErrorCode))" }
   } finally { foreach ($k in $bak.Keys) { [Environment]::SetEnvironmentVariable($k, $bak[$k]) } }
-  $r = [ordered]@{ tag = $tag; up = $false; walk = $null; walk_rc = $null; window_title = ''; closed_by_wm_close = $false; leftovers = 0 }
+  $r = [ordered]@{ tag = $tag; up = $false; start_error = $startErr; walk = $null; walk_rc = $null; window_title = ''; closed_by_wm_close = $false; leftovers = 0 }
+  if (-not $p) { $r.output = [ordered]@{ sources = @(); chars = 0; write_errors = 0; sample = @() }; return $r }
   $deadline = (Get-Date).AddSeconds($LaunchTimeoutSec)
   while ((Get-Date) -lt $deadline -and -not $p.HasExited) {
     Start-Sleep -Seconds 2
@@ -228,19 +235,33 @@ $dirB = 'C:\Program Files\AgentSpace'
 & robocopy $dirA $dirB /E /NFL /NDL /NJH /NJS /NP | Out-Null
 if ($LASTEXITCODE -ge 8) { Step 'read-only copy' 'unmeasured' "robocopy exit $LASTEXITCODE"; Finish }
 $LASTEXITCODE = 0
-$acl = & icacls $dirB /inheritance:r /grant:r '*S-1-1-0:(OI)(CI)RX' '*S-1-5-18:(OI)(CI)F' /T /C /Q 2>&1
+# Run 1 used "/inheritance:r + Everyone RX + SYSTEM F" and Start-Process then failed with
+# "Access is denied". Now the copy keeps the Program Files ACL it inherits (Users RX,
+# Administrators/SYSTEM/TrustedInstaller F, app packages RX) and an inheritable DENY for
+# Everyone blocks write data/add file (WD), append/add folder (AD), delete child (DC) and
+# delete (D). A deny beats the Administrators allow, so the elevated runner account is
+# held to read+execute like a standard user. Not "W": that set holds SYNCHRONIZE, which
+# every open of the file (and process start) also asks for.
+$acl = & icacls $dirB /deny '*S-1-1-0:(OI)(CI)(WD,AD,DC,D)' /C /Q 2>&1
 $exeB = Find-Exe $dirB
 $probeDir = Join-Path $dirB 'resources\standalone\.next\server'
 $denied = [ordered]@{}
-foreach ($t in @(@{ k = 'file'; p = (Join-Path $probeDir 'seal-write-probe.txt') }, @{ k = 'folder'; p = (Join-Path $probeDir 'route-cache-probe') })) {
+$existing = Join-Path $dirB 'resources\standalone\server.js'
+foreach ($t in @(@{ k = 'file'; p = (Join-Path $probeDir 'seal-write-probe.txt') }, @{ k = 'folder'; p = (Join-Path $probeDir 'route-cache-probe') }, @{ k = 'overwrite'; p = $existing })) {
   try {
-    if ($t.k -eq 'file') { [IO.File]::WriteAllText($t.p, 'x') } else { [IO.Directory]::CreateDirectory($t.p) | Out-Null }
+    if ($t.k -eq 'file') { [IO.File]::WriteAllText($t.p, 'x') }
+    elseif ($t.k -eq 'folder') { [IO.Directory]::CreateDirectory($t.p) | Out-Null }
+    else { $fs = [IO.File]::Open($t.p, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite); $fs.Dispose() }  # opened for write, nothing written
     $denied[$t.k] = 'WRITE SUCCEEDED'
-    Remove-Item -LiteralPath $t.p -Recurse -Force -ErrorAction SilentlyContinue
-  } catch { $denied[$t.k] = "refused: $($_.Exception.GetType().Name)" }
+    if ($t.k -ne 'overwrite') { Remove-Item -LiteralPath $t.p -Recurse -Force -ErrorAction SilentlyContinue }
+  } catch { $denied[$t.k] = "refused: $($_.Exception.GetType().Name): $($_.Exception.Message)" }
 }
-$roOk = ($denied.file -like 'refused*') -and ($denied.folder -like 'refused*') -and [bool]$exeB
-Step 'read-only copy' $(if ($roOk) { 'pass' } else { 'unmeasured' }) ([ordered]@{ dir = $dirB; exe = $exeB; icacls = (($acl | Select-Object -Last 1) -as [string]); test_write = $denied; whoami = (& whoami) })
+# the exe must stay readable + startable: read it, ask Windows what the ACL is
+$exeRead = 'no exe'
+if ($exeB) { try { $fs = [IO.File]::OpenRead($exeB); $exeRead = "read ok ($($fs.Length) bytes)"; $fs.Dispose() } catch { $exeRead = "read refused: $($_.Exception.Message)" } }
+$exeAcl = $(if ($exeB) { ((& icacls $exeB 2>&1) | Where-Object { "$_".Trim() } | ForEach-Object { "$_".Trim() }) -join ' | ' } else { '' })
+$roOk = ($denied.file -like 'refused*') -and ($denied.folder -like 'refused*') -and ($denied.overwrite -like 'refused*') -and [bool]$exeB -and ($exeRead -like 'read ok*')
+Step 'read-only copy' $(if ($roOk) { 'pass' } else { 'unmeasured' }) ([ordered]@{ dir = $dirB; exe = $exeB; icacls = (($acl | Select-Object -Last 1) -as [string]); exe_acl = $exeAcl; exe_read = $exeRead; test_write = $denied; whoami = (& whoami) })
 if (-not $roOk) { Finish }
 
 # -- A) per-user folder (writable) -----------------------------------------------
@@ -259,6 +280,7 @@ if ($want -eq 'broken') {
 $t1 = Get-Tree $dirB
 $b1 = Invoke-Run $exeB 'B1-readonly-debuglog' @{ NEXT_PRIVATE_DEBUG_CACHE = '1' }
 Step 'B1 walk (read-only, cache debug log on)' $(if ($b1.up -and $b1.walk_rc -eq 0) { 'pass' } else { 'unmeasured' }) $b1
+if (-not $b1.up) { Step 'B expectation' 'unmeasured' "the read-only copy did not come up: $($b1.start_error)"; Finish }
 $b2 = Invoke-Run $exeB 'B2-readonly-user' @{}
 Step 'B2 walk (read-only, like a user)' $(if ($b2.up -and $b2.walk_rc -eq 0) { 'pass' } else { 'unmeasured' }) $b2
 $dB = Compare-Tree $t1 (Get-Tree $dirB)
@@ -266,6 +288,6 @@ Step 'B folder unchanged' $(if ($dB.added -eq 0 -and $dB.changed -eq 0 -and $dB.
 if ($want -eq 'broken') {
   Step 'B expectation' $(if ($b1.output.write_errors -gt 0) { 'pass' } else { 'unmeasured' }) "expect broken: write errors seen with the cache debug log: $($b1.output.write_errors) (must be > 0, otherwise the output search cannot see a failed write); like a user: $($b2.output.write_errors)"
 } else {
-  Step 'B expectation' $(if ($b1.output.write_errors -eq 0 -and $b2.output.write_errors -eq 0 -and $b1.up -and $b2.up) { 'pass' } else { 'fail' }) "expect intact: write errors with the cache debug log: $($b1.output.write_errors), like a user: $($b2.output.write_errors) (both must be 0)"
+  Step 'B expectation' $(if (-not $b2.up) { 'unmeasured' } elseif ($b1.output.write_errors -eq 0 -and $b2.output.write_errors -eq 0) { 'pass' } else { 'fail' }) "expect intact: write errors with the cache debug log: $($b1.output.write_errors), like a user: $($b2.output.write_errors) (both must be 0)"
 }
 Finish
