@@ -1,0 +1,117 @@
+# Does `codex login` open the system browser BY ITSELF, and does it honour BROWSER?
+# Real Codex CLIs from npm (pinned versions), throwaway CODEX_HOME, on macOS (the question)
+# with Ubuntu as the control arm and Windows for information. See scripts/codexBrowserProbe.cjs
+# for the arms (idle baseline, BROWSER logger, the app's environment, BROWSER unset, positive
+# control with the OS opener).
+#
+# REPO RULE: no app source code and no unreleased build ever goes into this repo.
+# This workflow installs only the public Codex CLI from npm and runs a test script.
+#
+# Security notes (same rules as linux-login.yml):
+# - Manual trigger only. No push / pull_request / schedule triggers.
+# - No secrets, no account. Nobody completes the sign-in; the throwaway CODEX_HOME is
+#   deleted after each arm. The sign-in address is written without its query values.
+# - Inputs reach the shell only through env vars and are checked against strict patterns.
+# - Actions are pinned to full commit SHAs. Read-only token.
+# - Standard runners only (free on a public repo).
+name: codex browser
+
+run-name: codex browser ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      codex_versions:
+        description: 'Codex CLI versions from npm, space separated (e.g. 0.164.0 0.166.0)'
+        required: false
+        type: string
+        default: '0.164.0 0.166.0'
+      request_id:
+        description: 'Shown in the run name only, so the caller can find its run (not used by any step)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-browser
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26, ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: install Codex CLIs from npm
+        env:
+          CODEX_VERSIONS: ${{ inputs.codex_versions }}
+        run: |
+          set -euo pipefail
+          for v in $CODEX_VERSIONS; do
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version $v"; exit 1; }
+            npm install --global --no-audit --no-fund --prefix "$RUNNER_TEMP/codex-$v" "@openai/codex@$v" >/dev/null
+          done
+          node --version
+
+      - name: virtual display (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          command -v Xvfb >/dev/null && command -v import >/dev/null || {
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xvfb imagemagick >/dev/null
+          }
+          Xvfb :99 -screen 0 1440x900x24 -nolisten tcp >/dev/null 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          sleep 2
+
+      - name: probe
+        env:
+          CODEX_VERSIONS: ${{ inputs.codex_versions }}
+        run: |
+          set -euo pipefail
+          mkdir -p codex-browser
+          for v in $CODEX_VERSIONS; do
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version $v"; exit 1; }
+            if [[ "$RUNNER_OS" == "Windows" ]]; then js="$RUNNER_TEMP/codex-$v/node_modules/@openai/codex/bin/codex.js"
+            else js="$RUNNER_TEMP/codex-$v/lib/node_modules/@openai/codex/bin/codex.js"; fi
+            echo "::group::codex $v"
+            node scripts/codexBrowserProbe.cjs --codex-js "$js" --label "codex-$v" --out codex-browser --wait 12
+            echo "::endgroup::"
+          done
+
+      - name: summary
+        if: ${{ !cancelled() }}
+        run: |
+          node -e '
+            const fs = require("fs"); const p = "codex-browser";
+            for (const f of fs.readdirSync(p).filter((f) => f.endsWith(".json"))) {
+              const r = JSON.parse(fs.readFileSync(p + "/" + f, "utf8"));
+              for (const a of r.arms) console.log([r.platform, r.codexVersion, a.arm, "BROWSER=" + (a.browserEnv || "-"), "starts=" + a.browserStarts.map((s) => s.name).join("+"), "logger=" + a.loggerCalls.length, "tabs=" + JSON.stringify(a.tabs || {})].join(" | "));
+            }' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: upload evidence (json, frames)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-browser-${{ matrix.runner }}-${{ github.run_id }}
+          path: codex-browser
+          if-no-files-found: warn
+          retention-days: 7
