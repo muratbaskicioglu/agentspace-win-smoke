@@ -353,6 +353,14 @@ function Add-Arm($arm) {
   Log ("{0} {1} [{2}] console_windows={3} new_visible={4} spawns={5} {6}" -f $mark, $arm.name, $arm.kind, $arm.console_windows, $arm.new_visible_windows,
     (($arm.spawns | ForEach-Object { $_.name }) -join ','), $arm.note)
   foreach ($w in $arm.windows) { Log ("      +{0} ms {1} ms visible  {2}  '{3}'  {4}  {5}" -f $w.first_ms, $w.visible_ms, $w.class, $w.title, $w.process, $w.rect) }
+  if ($arm.Contains('launch')) {
+    Log ("      launch: console_windows={0}" -f $arm.launch.console_windows)
+    foreach ($o in @($arm.launch.owners)) {
+      if ($null -eq $o) { continue }
+      $by = $(if ($o.created_by) { "{0} (pid {1}) '{2}'" -f $o.created_by.parent, $o.created_by.ppid, $o.created_by.cmd } else { 'no 4688 event' })
+      Log ("      launch window '{0}' {1} pid {2}: started by {3}; in app tree: {4}" -f $o.title, $o.process, $o.window_pid, $by, $o.in_app_tree)
+    }
+  }
   if (-not $arm.ok) { if ($arm.kind -eq 'control') { $unmeasured.Add($arm.name) } else { $fails.Add($arm.name) } }
 }
 
@@ -392,12 +400,23 @@ for ($i = 1; $i -le $Closes; $i++) {
   $atLaunch = Select-Tree $spawnsAll ([int64]$pb.Id) $launchAt
   $cw = Count-Console $wins
   $ping = @($wins | Where-Object { $_.process -match '^(?i)ping$' -or $_.title -match '(?i)ping' }).Count
+  # Who started each console window seen during launch: its process creation event (4688)
+  # and whether that process belongs to the app's own process tree.
+  $launchOwners = @(@($launchWins) | Where-Object { $null -ne $_ -and $_.console } | ForEach-Object {
+    $w = $_
+    $sp = @($spawnsAll | Where-Object { $_.pid -eq [int64]$w.pid } | Select-Object -Last 1)
+    [ordered]@{
+      window_pid = $w.pid; process = $w.process; title = $w.title
+      created_by = $(if ($sp.Count) { [ordered]@{ ppid = $sp[0].ppid; parent = (Split-Path $sp[0].parent -Leaf); cmd = $sp[0].cmd } } else { $null })
+      in_app_tree = (@($atLaunch | Where-Object { $_.pid -eq [int64]$w.pid }).Count -gt 0)
+    }
+  })
   Add-Arm ([ordered]@{
     name = $tag; kind = 'control'; ok = ($cw -ge 1); console_windows = $cw; new_visible_windows = (Count-Visible $wins)
     ping_windows = $ping; windows = $wins; spawns = $atClose
     close = [ordered]@{ exited = $exited; seconds = $closeSec; exit_code = $(if ($exited) { $pb.ExitCode } else { $null }) }
     leftovers_plus_1s = $early; leftovers_end = $late
-    launch = [ordered]@{ console_windows = (Count-Console $launchWins); windows = @($launchWins | Where-Object { $_.console }); console_spawns = @($atLaunch | Where-Object { $_.t -lt $c0.ToString('HH:mm:ss.fff') -and $_.name -match '^(?i)(cmd|ping|taskkill|where|reg|wmic|powershell|pwsh|tasklist|conhost)\.exe$' }) }
+    launch = [ordered]@{ console_windows = (Count-Console $launchWins); windows = @($launchWins | Where-Object { $_.console }); owners = $launchOwners; console_spawns = @($atLaunch | Where-Object { $_.t -lt $c0.ToString('HH:mm:ss.fff') -and $_.name -match '^(?i)(cmd|ping|taskkill|where|reg|wmic|powershell|pwsh|tasklist|conhost|wsl|bash|sh|git)\.exe$' }) }
     note = "published build: a console window is expected here (close took $closeSec s)"
   })
   Copy-AppLogs $iso $tag $launchAt
