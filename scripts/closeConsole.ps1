@@ -336,14 +336,16 @@ function Count-Other($wins) { return @(@($wins) | Where-Object { $null -ne $_ -a
 # or 'other' (another process on the runner; listed with its creator, not counted).
 function Set-Origin($wins, $treeSpawns, [int64]$rootPid, $allSpawns) {
   $pids = @{ $rootPid = $true }
-  foreach ($t in @($treeSpawns)) { if ($null -ne $t) { $pids[[int64]$t.pid] = $true } }
-  foreach ($w in @($wins)) {
+  # No @() around the spawn lists: they are generic lists, and @() on them fails in the
+  # binder ("Argument types do not match"). foreach over $null runs zero times.
+  foreach ($t in $treeSpawns) { if ($null -ne $t) { $pids[[int64]$t.pid] = $true } }
+  foreach ($w in $wins) {
     if ($null -eq $w) { continue }
     if ($pids.ContainsKey([int64]$w.pid)) { $w.origin = 'app' }
     elseif ([string]$w.process -match '^(?i)(windowsterminal|openconsole|conhost)$') { $w.origin = 'console-host' }
     else {
       $w.origin = 'other'
-      $sp = @(@($allSpawns) | Where-Object { $null -ne $_ -and $_.pid -eq [int64]$w.pid } | Select-Object -Last 1)
+      $sp = @($allSpawns | Where-Object { $null -ne $_ -and $_.pid -eq [int64]$w.pid } | Select-Object -Last 1)
       if ($sp.Count) { $w.started_by = (Split-Path $sp[0].parent -Leaf) } else { $w.started_by = 'before the arm / no 4688 event' }
     }
   }
