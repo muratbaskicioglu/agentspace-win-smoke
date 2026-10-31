@@ -106,21 +106,42 @@ async function main() {
   })()`);
   note('screen-after-click', after);
   await shot(`${A.label}-2-after-click.png`);
-  // The status line under the button: is it inside the window without scrolling?
-  const status = await evalJs(`(() => {
+  // The status line under the button: can the user SEE it without scrolling?
+  // Three checks, because "inside the window" is not "visible":
+  //   inWindow  – the box is inside the window
+  //   clippedBy – a scrolling/clipping ancestor cuts the box off (it is outside the ancestor's box)
+  //   topmost   – what is really drawn at the box centre (another layer may cover it)
+  const MEASURE = `(() => {
     const re = /could not start sign-in|browser opened|giriş başlatılamadı|tarayıcı açıldı/i;
     const el = [...document.querySelectorAll('p, div, span')].filter((x) => re.test(x.innerText || '') && x.children.length === 0)[0]
       || [...document.querySelectorAll('p, div, span')].filter((x) => re.test(x.innerText || '')).pop();
     if (!el) return null;
     const r = el.getBoundingClientRect();
-    return { text: el.innerText.trim().slice(0, 160), top: Math.round(r.top), bottom: Math.round(r.bottom), viewport: innerHeight, visibleWithoutScroll: r.top >= 0 && r.bottom <= innerHeight };
-  })()`);
+    const tag = (n) => n ? (n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') + (n.getAttribute && n.getAttribute('data-testid') ? '[data-testid=' + n.getAttribute('data-testid') + ']' : '') + (typeof n.className === 'string' && n.className ? '.' + n.className.trim().split(/\\s+/).slice(0, 3).join('.') : '')) : null;
+    let clippedBy = null;
+    for (let a = el.parentElement; a && a !== document.documentElement; a = a.parentElement) {
+      const cs = getComputedStyle(a);
+      if (/(auto|scroll|hidden|clip)/.test(cs.overflowY + ' ' + cs.overflow)) {
+        const ar = a.getBoundingClientRect();
+        if (r.bottom > ar.bottom + 1 || r.top < ar.top - 1) { clippedBy = { el: tag(a), top: Math.round(ar.top), bottom: Math.round(ar.bottom), scrollTop: Math.round(a.scrollTop), scrollHeight: a.scrollHeight, clientHeight: a.clientHeight }; break; }
+      }
+    }
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const hit = (cy >= 0 && cy < innerHeight) ? document.elementFromPoint(cx, cy) : null;
+    const topmostIsNote = !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+    const inWindow = r.top >= 0 && r.bottom <= innerHeight;
+    return { text: el.innerText.trim().slice(0, 160), top: Math.round(r.top), bottom: Math.round(r.bottom), viewport: innerHeight,
+      inWindow, clippedBy, topmost: topmostIsNote ? 'the note itself' : tag(hit),
+      visibleWithoutScroll: inWindow && !clippedBy && topmostIsNote };
+  })()`;
+  const status = await evalJs(MEASURE);
   note('note-after-click', status || 'no status line');
   if (status && !status.visibleWithoutScroll) {
-    await evalJs(`(() => { const re = /could not start sign-in|browser opened/i;
+    await evalJs(`(() => { const re = /could not start sign-in|browser opened|giriş başlatılamadı|tarayıcı açıldı/i;
       const el = [...document.querySelectorAll('p, div, span')].filter((x) => re.test(x.innerText || '')).pop(); if (el) el.scrollIntoView({ block: 'center' }); })()`);
     await sleep(800);
     await shot(`${A.label}-3-note-scrolled.png`);
+    note('note-after-scroll', await evalJs(MEASURE));
   }
   c.close();
   return done(0);

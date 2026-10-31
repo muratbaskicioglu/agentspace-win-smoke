@@ -130,7 +130,8 @@ FD
   ELECTRON_RUN_AS_NODE=1 "$BIN" "$HERE/loginDrive.cjs" --port "$PORT" --out "$R" --label "$ARM" --wait-after 12000 > "$R/drive.txt" 2>&1
   DRC=$?
   res drive "exit $DRC: $(grep -E '\] (click|button|keychain-warning-before-click):' "$R/drive.txt" | sed 's/^\[[^]]*\] //' | tr '\n' ' ' | cut -c1-600)"
-  res screen-note "$(grep -E '\] note-after-click:' "$R/drive.txt" | sed 's/^\[[^]]*\] //' | cut -c1-400)"
+  res screen-note "$(grep -E '\] note-after-click:' "$R/drive.txt" | sed 's/^\[[^]]*\] //' | cut -c1-700)"
+  res screen-note-scrolled "$(grep -E '\] note-after-scroll:' "$R/drive.txt" | sed 's/^\[[^]]*\] //' | cut -c1-700)"
   L="$R/app-stdout.txt"
   res app-backend "$(grep -m1 -o 'safeStorage: kullanılabilir=.*' "$L" | cut -c1-220)"
   res app-scheme-registration "$(grep -m1 -o 'Linux masaüstü kaydı:.*' "$L" | cut -c1-300)"
