@@ -106,6 +106,22 @@ async function main() {
   })()`);
   note('screen-after-click', after);
   await shot(`${A.label}-2-after-click.png`);
+  // The status line under the button: is it inside the window without scrolling?
+  const status = await evalJs(`(() => {
+    const re = /could not start sign-in|browser opened|giriş başlatılamadı|tarayıcı açıldı/i;
+    const el = [...document.querySelectorAll('p, div, span')].filter((x) => re.test(x.innerText || '') && x.children.length === 0)[0]
+      || [...document.querySelectorAll('p, div, span')].filter((x) => re.test(x.innerText || '')).pop();
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { text: el.innerText.trim().slice(0, 160), top: Math.round(r.top), bottom: Math.round(r.bottom), viewport: innerHeight, visibleWithoutScroll: r.top >= 0 && r.bottom <= innerHeight };
+  })()`);
+  note('note-after-click', status || 'no status line');
+  if (status && !status.visibleWithoutScroll) {
+    await evalJs(`(() => { const re = /could not start sign-in|browser opened/i;
+      const el = [...document.querySelectorAll('p, div, span')].filter((x) => re.test(x.innerText || '')).pop(); if (el) el.scrollIntoView({ block: 'center' }); })()`);
+    await sleep(800);
+    await shot(`${A.label}-3-note-scrolled.png`);
+  }
   c.close();
   return done(0);
 }

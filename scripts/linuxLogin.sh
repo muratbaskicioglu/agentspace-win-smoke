@@ -25,7 +25,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 app_pids() {
   ps -eo pid=,comm=,args= | AS_IMG="${IMG:-/nonexistent}" AS_MNT='/.mount_AgentS' awk '
-    $2 != "awk" && $2 != "ps" && (index($0, ENVIRON["AS_IMG"]) || index($0, ENVIRON["AS_MNT"])) { print $1 }' | tr '\n' ' '
+    index($3, ENVIRON["AS_IMG"]) == 1 || index($3, ENVIRON["AS_MNT"]) { print $1 }' | tr '\n' ' '
 }
 main_pid() {
   ps -eo pid=,comm=,args= | AS_MNT='/.mount_AgentS' awk '
@@ -55,7 +55,10 @@ if [[ $INNER -eq 1 ]]; then
     no-desktop)       : ;;
     no-desktop-flag)  EXTRA=(--password-store=gnome-libsecret) ;;
     gnome-no-keyring) export XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_DESKTOP=gnome DESKTOP_SESSION=gnome; KEYRING=0 ;;
+    no-keyring-flag)  KEYRING=0; EXTRA=(--password-store=gnome-libsecret) ;;
     kde-no-kwallet)   export XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma KDE_SESSION_VERSION=6 KDE_FULL_SESSION=true ;;
+    kde-no-kwallet-flag) export XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma KDE_SESSION_VERSION=6 KDE_FULL_SESSION=true
+                      EXTRA=(--password-store=gnome-libsecret) ;;
     *) echo "unknown arm $ARM"; exit 2 ;;
   esac
   res desktop "XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-<unset>} KDE_SESSION_VERSION=${KDE_SESSION_VERSION:-<unset>} flags=${EXTRA[*]:-none}"
@@ -102,8 +105,8 @@ if command -v google-chrome >/dev/null 2>&1; then
   if [[ "$out" == *browser-ok* ]]; then echo "google-chrome: started (rc=$rc)"; else echo "google-chrome: FAILED rc=$rc $(grep -v '^$' "$T/c.err" | tail -2 | tr '\n' ' ' | cut -c1-300)"; fi
 fi >> "$HOME/fakebrowser.env"
 if command -v firefox >/dev/null 2>&1; then
-  timeout 60 firefox --headless --no-remote --profile "$T/f" --screenshot "$T/f.png" 'data:text/html,<p>browser-ok</p>' >"$T/f.out" 2>&1; rc=$?
   mkdir -p "$T/f"
+  timeout 60 firefox --headless --no-remote --profile "$T/f" --screenshot "$T/f.png" 'data:text/html,<p>browser-ok</p>' >"$T/f.out" 2>&1; rc=$?
   if [[ -s "$T/f.png" ]]; then echo "firefox: started (rc=$rc)"; else echo "firefox: FAILED rc=$rc $(grep -v '^$' "$T/f.out" | tail -2 | tr '\n' ' ' | cut -c1-300)"; fi
 fi >> "$HOME/fakebrowser.env"
 rm -rf "$T"
@@ -127,6 +130,7 @@ FD
   ELECTRON_RUN_AS_NODE=1 "$BIN" "$HERE/loginDrive.cjs" --port "$PORT" --out "$R" --label "$ARM" --wait-after 12000 > "$R/drive.txt" 2>&1
   DRC=$?
   res drive "exit $DRC: $(grep -E '\] (click|button|keychain-warning-before-click):' "$R/drive.txt" | sed 's/^\[[^]]*\] //' | tr '\n' ' ' | cut -c1-600)"
+  res screen-note "$(grep -E '\] note-after-click:' "$R/drive.txt" | sed 's/^\[[^]]*\] //' | cut -c1-400)"
   L="$R/app-stdout.txt"
   res app-backend "$(grep -m1 -o 'safeStorage: kullanılabilir=.*' "$L" | cut -c1-220)"
   res app-scheme-registration "$(grep -m1 -o 'Linux masaüstü kaydı:.*' "$L" | cut -c1-300)"
@@ -140,6 +144,7 @@ FD
   else
     res browser-opened "NO — the system browser was not asked to open anything"
   fi
+  [[ "${XDG_CURRENT_DESKTOP:-}" == KDE ]] && res kde-note "xdg-open on KDE hands over to kde-open, which is not on this image: browser hand-off and return are NOT representative in KDE arms; read app-signin"
   res agentspace-handler-after "$(xdg-mime query default x-scheme-handler/agentspace 2>&1 || true)"
   ls "$HOME/.local/share/applications" > "$R/applications.txt" 2>&1
 
@@ -205,10 +210,10 @@ cat > "$SESSION_CONF" <<'CONF'
 CONF
 
 PORT=9333; RC=0
-for arm in gnome no-desktop no-desktop-flag gnome-no-keyring kde-no-kwallet; do
+for arm in gnome no-desktop no-desktop-flag gnome-no-keyring no-keyring-flag kde-no-kwallet kde-no-kwallet-flag; do
   echo "════ arm $arm"
   conf=()
-  [[ "$arm" == gnome-no-keyring ]] && conf=(--config-file="$SESSION_CONF")
+  [[ "$arm" == gnome-no-keyring || "$arm" == no-keyring-flag ]] && conf=(--config-file="$SESSION_CONF")
   IMG="$IMG" dbus-run-session "${conf[@]}" -- bash "$0" --arm "$arm" "$IMG" "$BIN" "$OUT" "$PORT" || RC=2
   IMG="$IMG"; stop_app
   PORT=$((PORT + 1))
