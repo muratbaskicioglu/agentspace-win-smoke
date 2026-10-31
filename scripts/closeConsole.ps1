@@ -7,7 +7,13 @@
 #   - window list: a watcher thread enumerates the top-level windows every 25 ms and
 #     records every NEW visible window (class, title, owner process). Console windows
 #     (ConsoleWindowClass / Windows Terminal) are counted; each one gets a capture of
-#     ITS OWN content (PrintWindow, not the desktop).
+#     ITS OWN content (PrintWindow, not the desktop). A second thread listens for the
+#     window-shown event (EVENT_OBJECT_SHOW), so a window that flashes for less than
+#     25 ms is still recorded.
+#   - origin: each window is matched to the process tree of the arm (4688). Windows of
+#     other processes on the runner (for example a wsl.exe prompt the image shows by
+#     itself) are listed as 'other' and do not count; console host windows (Windows
+#     Terminal, OpenConsole, conhost) cannot be matched and DO count.
 #   - process creation audit (Security event 4688 with command line): which console
 #     programs the app tree started (cmd.exe, PING.EXE, taskkill.exe, ...).
 #
@@ -16,8 +22,9 @@
 #                       CONTROL: the published build is expected to show console windows.
 #   probe cases         closeConsoleProbe.cjs, run by the installed app binary in Node
 #                       mode with the app's own modules (see that file). "*-published"
-#                       = shipped options (control), "*-fix" = the fix branch's options
-#                       applied to the same call (this repo never holds unreleased builds).
+#                       = shipped options (watchdog: control; taskkill / cli: observed and
+#                       reported, no verdict), "*-fix" = the fix branch's options applied to
+#                       the same call (this repo never holds unreleased builds).
 #
 # No account, no sign-in, no user data. Each launch has its own temporary
 # AGENTDESK_HOME and --user-data-dir.
@@ -54,6 +61,7 @@ public class CcSeen {
   public long FirstMs; public long LastMs; public long Hwnd; public string Cls = ""; public string Title = "";
   public uint Pid; public string Proc = ""; public int X; public int Y; public int W; public int H;
   public bool Cloaked; public bool ConsoleLike; public int Shots; public string ShotFiles = "";
+  public string Via = "poll"; public int ShowEvents;
 }
 
 public static class CcWin {
@@ -74,6 +82,16 @@ public static class CcWin {
   [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
   [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
   [DllImport("gdi32.dll")] static extern int GetDIBits(IntPtr dc, IntPtr bmp, uint start, uint lines, byte[] bits, ref BITMAPINFOHEADER bi, uint usage);
+  public delegate void WinEventProc(IntPtr hook, uint ev, IntPtr h, int idObject, int idChild, uint thread, uint time);
+  [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint evMin, uint evMax, IntPtr mod, WinEventProc cb, uint pid, uint tid, uint flags);
+  [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
+  [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr h, uint a, uint b);
+  [DllImport("user32.dll")] static extern bool PostThreadMessage(uint tid, uint msg, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  [DllImport("user32.dll")] static extern IntPtr GetDesktopWindow();
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  // Larger than the native MSG on purpose (GetMessage writes sizeof(MSG) bytes).
+  [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; public long pad1; public long pad2; }
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L; public int T; public int R; public int B; }
   [StructLayout(LayoutKind.Sequential)] public struct BITMAPINFOHEADER {
     public uint biSize; public int biWidth; public int biHeight; public ushort biPlanes; public ushort biBitCount;
@@ -88,6 +106,8 @@ public static class CcWin {
   static string dir = ""; static string tag = ""; static int interval = 25;
   static EnumProc cb; static List<IntPtr> buf = new List<IntPtr>();
   public static int ShotBudget = 24;
+  static Thread evTh; static volatile uint evTid; static WinEventProc evCb; static ManualResetEvent evReady;
+  public static bool EventHookOk;
 
   static bool OnWin(IntPtr h, IntPtr l) { if (IsWindowVisible(h)) buf.Add(h); return true; }
   static List<IntPtr> Visible() { buf = new List<IntPtr>(); EnumWindows(cb, IntPtr.Zero); return buf; }
@@ -99,13 +119,45 @@ public static class CcWin {
     baseline = new HashSet<long>();
     foreach (IntPtr h in Visible()) baseline.Add(h.ToInt64());
     stopFlag = false; sw = Stopwatch.StartNew();
+    evReady = new ManualResetEvent(false); EventHookOk = false;
+    evTh = new Thread(EvLoop); evTh.IsBackground = true; evTh.SetApartmentState(ApartmentState.STA); evTh.Start();
+    evReady.WaitOne(5000);
     th = new Thread(Loop); th.IsBackground = true; th.Start();
     return baseline.Count;
+  }
+  // EVENT_OBJECT_SHOW (0x8002), out of context, skip own process: every top-level window
+  // that becomes visible, however short.
+  static void EvLoop() {
+    evTid = GetCurrentThreadId();
+    evCb = new WinEventProc(OnShow);
+    IntPtr hook = SetWinEventHook(0x8002, 0x8002, IntPtr.Zero, evCb, 0, 0, 0x0000 | 0x0002);
+    EventHookOk = hook != IntPtr.Zero;
+    evReady.Set();
+    if (!EventHookOk) return;
+    MSG m;
+    while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { }
+    UnhookWinEvent(hook);
+  }
+  static void OnShow(IntPtr hk, uint ev, IntPtr h, int idObject, int idChild, uint thread, uint time) {
+    try {
+      if (idObject != 0 || idChild != 0 || h == IntPtr.Zero) return;
+      if (GetAncestor(h, 1) != GetDesktopWindow()) return;
+      long k = h.ToInt64();
+      if (baseline.Contains(k)) return;
+      long now = sw.ElapsedMilliseconds;
+      lock (Gate) {
+        CcSeen s;
+        if (!seen.TryGetValue(k, out s)) { s = Describe(h, now); s.Via = "event"; seen[k] = s; }
+        s.ShowEvents++;
+        if (now > s.LastMs) s.LastMs = now;
+      }
+    } catch { }
   }
   public static long ElapsedMs() { return sw == null ? 0 : sw.ElapsedMilliseconds; }
   public static CcSeen[] Stop() {
     stopFlag = true;
     if (th != null) th.Join(5000);
+    if (evTh != null && evTid != 0) { PostThreadMessage(evTid, 0x0012, IntPtr.Zero, IntPtr.Zero); evTh.Join(5000); }
     lock (Gate) { return new List<CcSeen>(seen.Values).ToArray(); }
   }
   static void Loop() {
@@ -122,6 +174,7 @@ public static class CcWin {
       CcSeen s;
       lock (Gate) {
         if (!seen.TryGetValue(k, out s)) { s = Describe(h, now); seen[k] = s; }
+        else if (s.Via == "event") s.Via = "event+poll";
         s.LastMs = now;
       }
       if (s.ConsoleLike && !s.Cloaked && ShotBudget > 0) {
@@ -181,7 +234,7 @@ public static class CcWin {
 
 $result = [ordered]@{
   verdict = 'unknown'; runner = $env:RUNNER_NAME; os = $null; installer = $null; installed_exe = $null
-  version = $null; audit = $null; arms = @()
+  version = $null; audit = $null; event_hook = $null; arms = @()
 }
 try {
   $osv = Get-CimInstance Win32_OperatingSystem
@@ -256,21 +309,45 @@ function Select-Tree($spawns, [int64]$rootPid, [datetime]$from) {
 }
 
 # -- window watcher wrappers --------------------------------------------------------
-function Start-Watch([string]$tag) { return [CcWin]::Start($OutFull, $tag, 25) }
+function Start-Watch([string]$tag) {
+  $n = [CcWin]::Start($OutFull, $tag, 25)
+  if ($null -eq $result.event_hook) { $result.event_hook = [CcWin]::EventHookOk; Log "- window-shown event hook: $([CcWin]::EventHookOk)" }
+  return $n
+}
 function Stop-Watch {
   $arr = [CcWin]::Stop()
   return @($arr | Sort-Object FirstMs | ForEach-Object {
     [ordered]@{
       first_ms = $_.FirstMs; visible_ms = ($_.LastMs - $_.FirstMs); class = $_.Cls; title = $_.Title
       pid = $_.Pid; process = $_.Proc; rect = "$($_.X),$($_.Y) $($_.W)x$($_.H)"; cloaked = $_.Cloaked
-      console = $_.ConsoleLike; captures = $_.ShotFiles
+      console = $_.ConsoleLike; captures = $_.ShotFiles; seen_by = $_.Via; show_events = $_.ShowEvents
+      origin = ''; started_by = ''
     }
   })
 }
 # An empty window list must count as 0 (a `$null` piped into Where-Object runs once, and StrictMode
 # then stops the script on the missing property), so callers wrap Stop-Watch in @() and these skip `$null.
-function Count-Console($wins) { return @(@($wins) | Where-Object { $null -ne $_ -and $_.console -and -not $_.cloaked }).Count }
-function Count-Visible($wins) { return @(@($wins) | Where-Object { $null -ne $_ -and -not $_.cloaked }).Count }
+function Count-Console($wins) { return @(@($wins) | Where-Object { $null -ne $_ -and $_.console -and -not $_.cloaked -and $_.origin -ne 'other' }).Count }
+function Count-Visible($wins) { return @(@($wins) | Where-Object { $null -ne $_ -and -not $_.cloaked -and $_.origin -ne 'other' }).Count }
+function Count-Other($wins) { return @(@($wins) | Where-Object { $null -ne $_ -and -not $_.cloaked -and $_.origin -eq 'other' }).Count }
+
+# origin of each window: 'app' (owner process is in the arm's process tree, from 4688),
+# 'console-host' (Windows Terminal / OpenConsole / conhost: cannot be matched, so it counts)
+# or 'other' (another process on the runner; listed with its creator, not counted).
+function Set-Origin($wins, $treeSpawns, [int64]$rootPid, $allSpawns) {
+  $pids = @{ $rootPid = $true }
+  foreach ($t in @($treeSpawns)) { if ($null -ne $t) { $pids[[int64]$t.pid] = $true } }
+  foreach ($w in @($wins)) {
+    if ($null -eq $w) { continue }
+    if ($pids.ContainsKey([int64]$w.pid)) { $w.origin = 'app' }
+    elseif ([string]$w.process -match '^(?i)(windowsterminal|openconsole|conhost)$') { $w.origin = 'console-host' }
+    else {
+      $w.origin = 'other'
+      $sp = @(@($allSpawns) | Where-Object { $null -ne $_ -and $_.pid -eq [int64]$w.pid } | Select-Object -Last 1)
+      if ($sp.Count) { $w.started_by = (Split-Path $sp[0].parent -Leaf) } else { $w.started_by = 'before the arm / no 4688 event' }
+    }
+  }
+}
 
 # Watchdog helpers still running that were created after $since (cmd / ping / taskkill
 # whose command line is the watchdog's), so unrelated system processes do not count.
@@ -349,10 +426,15 @@ $unmeasured = New-Object System.Collections.Generic.List[string]
 
 function Add-Arm($arm) {
   $result.arms += $arm
-  $mark = $(if ($arm.ok) { 'OK  ' } else { 'FAIL' })
-  Log ("{0} {1} [{2}] console_windows={3} new_visible={4} spawns={5} {6}" -f $mark, $arm.name, $arm.kind, $arm.console_windows, $arm.new_visible_windows,
-    (($arm.spawns | ForEach-Object { $_.name }) -join ','), $arm.note)
-  foreach ($w in $arm.windows) { Log ("      +{0} ms {1} ms visible  {2}  '{3}'  {4}  {5}" -f $w.first_ms, $w.visible_ms, $w.class, $w.title, $w.process, $w.rect) }
+  $mark = $(if ($arm.kind -eq 'observe') { 'OBS ' } elseif ($arm.ok) { 'OK  ' } else { 'FAIL' })
+  $other = $(if ($arm.Contains('other_windows')) { $arm.other_windows } else { 0 })
+  Log ("{0} {1} [{2}] console_windows={3} new_visible={4} other_processes={5} spawns={6} {7}" -f $mark, $arm.name, $arm.kind, $arm.console_windows, $arm.new_visible_windows,
+    $other, (($arm.spawns | ForEach-Object { $_.name }) -join ','), $arm.note)
+  foreach ($w in @($arm.windows)) {
+    if ($null -eq $w) { continue }
+    $from = $(if ($w.origin -eq 'other') { "other (started by $($w.started_by))" } else { $w.origin })
+    Log ("      +{0} ms {1} ms visible  {2}  '{3}'  {4}  {5}  [{6}; seen by {7}]" -f $w.first_ms, $w.visible_ms, $w.class, $w.title, $w.process, $w.rect, $from, $w.seen_by)
+  }
   if ($arm.Contains('launch')) {
     Log ("      launch: console_windows={0}" -f $arm.launch.console_windows)
     foreach ($o in @($arm.launch.owners)) {
@@ -361,7 +443,7 @@ function Add-Arm($arm) {
       Log ("      launch window '{0}' {1} pid {2}: started by {3}; in app tree: {4}" -f $o.title, $o.process, $o.window_pid, $by, $o.in_app_tree)
     }
   }
-  if (-not $arm.ok) { if ($arm.kind -eq 'control') { $unmeasured.Add($arm.name) } else { $fails.Add($arm.name) } }
+  if ($arm.kind -ne 'observe' -and -not $arm.ok) { if ($arm.kind -eq 'control') { $unmeasured.Add($arm.name) } else { $fails.Add($arm.name) } }
 }
 
 # -- arm 1: the published app, real launch + WM_CLOSE (control) ------------------------
@@ -398,6 +480,8 @@ for ($i = 1; $i -le $Closes; $i++) {
   $spawnsAll = Get-Spawns $launchAt
   $atClose = Select-Tree $spawnsAll ([int64]$pb.Id) $c0
   $atLaunch = Select-Tree $spawnsAll ([int64]$pb.Id) $launchAt
+  Set-Origin $wins $atLaunch ([int64]$pb.Id) $spawnsAll
+  Set-Origin $launchWins $atLaunch ([int64]$pb.Id) $spawnsAll
   $cw = Count-Console $wins
   $ping = @($wins | Where-Object { $_.process -match '^(?i)ping$' -or $_.title -match '(?i)ping' }).Count
   # Who started each console window seen during launch: its process creation event (4688)
@@ -412,7 +496,7 @@ for ($i = 1; $i -le $Closes; $i++) {
     }
   })
   Add-Arm ([ordered]@{
-    name = $tag; kind = 'control'; ok = ($cw -ge 1); console_windows = $cw; new_visible_windows = (Count-Visible $wins)
+    name = $tag; kind = 'control'; ok = ($cw -ge 1); console_windows = $cw; new_visible_windows = (Count-Visible $wins); other_windows = (Count-Other $wins)
     ping_windows = $ping; windows = $wins; spawns = $atClose
     close = [ordered]@{ exited = $exited; seconds = $closeSec; exit_code = $(if ($exited) { $pb.ExitCode } else { $null }) }
     leftovers_plus_1s = $early; leftovers_end = $late
@@ -429,8 +513,8 @@ for ($i = 1; $i -le $Closes; $i++) {
 $probe = Join-Path $PSScriptRoot 'closeConsoleProbe.cjs'
 $cases = [ordered]@{
   'watchdog-published' = 'control'; 'watchdog-fix' = 'fix'; 'watchdog-fix-hang' = 'fix'
-  'taskkill-published' = 'control'; 'taskkill-fix' = 'fix'
-  'cli-published' = 'control'; 'cli-fix' = 'fix'
+  'taskkill-published' = 'observe'; 'taskkill-fix' = 'fix'
+  'cli-published' = 'observe'; 'cli-fix' = 'fix'
 }
 foreach ($case in $cases.Keys) {
   $kind = $cases[$case]
@@ -445,15 +529,20 @@ foreach ($case in $cases.Keys) {
   Start-Sleep -Seconds $AfterSec
   $wins = @(Stop-Watch)
   $late = @(Get-Leftovers $t0)
-  $spawns = Select-Tree (Get-Spawns $t0) ([int64]$pp.Id) $t0
+  $spawnsSince = Get-Spawns $t0
+  $spawns = Select-Tree $spawnsSince ([int64]$pp.Id) $t0
+  Set-Origin $wins $spawns ([int64]$pp.Id) $spawnsSince
   $pj = $null; if (Test-Path $json) { $pj = Get-Content -Raw $json | ConvertFrom-Json }
   $cw = Count-Console $wins; $nv = Count-Visible $wins
   $arm = [ordered]@{
-    name = $case; kind = $kind; console_windows = $cw; new_visible_windows = $nv; windows = $wins; spawns = $spawns
+    name = $case; kind = $kind; console_windows = $cw; new_visible_windows = $nv; other_windows = (Count-Other $wins); windows = $wins; spawns = $spawns
     probe_exit = $(if ($done) { $pp.ExitCode } else { 'still running after 40 s' }); probe = $pj
     leftovers_plus_1s = $early; leftovers_end = $late; note = ''
   }
-  if ($kind -eq 'control') {
+  if ($kind -eq 'observe') {
+    $arm.ok = $true
+    $arm.note = $(if ($cw -ge 1) { 'shipped options: console window seen' } else { 'shipped options: no window seen on this runner' })
+  } elseif ($kind -eq 'control') {
     $arm.ok = ($cw -ge 1)
     $arm.note = $(if ($arm.ok) { 'shipped options: console window seen (control holds)' } else { 'shipped options showed NO window: the check cannot see the defect here' })
   } else {
@@ -488,10 +577,11 @@ Save-Result $code
 if ($env:GITHUB_STEP_SUMMARY) {
   $osText = $(if ($result.os) { "$($result.os.caption) $($result.os.version)" } else { 'Windows' })
   $s = @("### close console - $osText - AgentSpace $($result.version)", '',
-    '| arm | kind | console windows | new visible windows | console programs started (4688) | note |', '|---|---|---|---|---|---|')
+    '| arm | kind | console windows | new visible windows | other processes (not counted) | console programs started (4688) | note |', '|---|---|---|---|---|---|---|')
   foreach ($a in $result.arms) {
     $names = (($a.spawns | ForEach-Object { $_.name }) | Select-Object -Unique) -join ', '
-    $s += "| $($a.name) | $($a.kind) | $($a.console_windows) | $($a.new_visible_windows) | $names | $($a.note) |"
+    $oth = $(if ($a.Contains('other_windows')) { $a.other_windows } else { 0 })
+    $s += "| $($a.name) | $($a.kind) | $($a.console_windows) | $($a.new_visible_windows) | $oth | $names | $($a.note) |"
   }
   $s += ''; $s += "verdict: **$($result.verdict)**"
   $s -join "`n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
