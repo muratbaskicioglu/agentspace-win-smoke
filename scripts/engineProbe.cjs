@@ -17,6 +17,14 @@
 //   opencode  real OpenCode pane with the app's own argv/env: alive after 25 s? leftovers?
 //   claude    real Claude Code pane built like the app's main process: alive? what did it print?
 //   ocreader  idle OpenCode input box (wide + narrow): what does the app's own reader say?
+//             Also saves the raw pty stream (<id>.raw.vt) and the per-row wrap flags (<id>.wrap.json)
+//             so the same screen can be replayed later through the reader.
+//   ocdeliver idle NARROW OpenCode pane: does the app's own delivery gate (agentxDeliver.paneStateOf)
+//             let a job through, and does the app's own writer (deliverPrompt) put it in the input
+//             box? Enter is NOT sent (it would reach a model): the Enter key write is swallowed.
+//
+// --overlay <dir> --overlay-files a.cjs,b.cjs: load those app modules from <dir> instead of the
+// app (used by a private test run to compare a fix with the shipped code; never used here).
 'use strict';
 const fs = require('node:fs');
 const os = require('node:os');
@@ -25,7 +33,7 @@ const cp = require('node:child_process');
 
 const IS_WIN = process.platform === 'win32';
 const ARGS = (() => {
-  const a = { app: null, out: 'engine-probe', codex: [], opencode: [], claude: [], only: null };
+  const a = { app: null, out: 'engine-probe', codex: [], opencode: [], claude: [], only: null, overlay: null, overlayFiles: [] };
   const v = process.argv.slice(2);
   for (let i = 0; i < v.length; i++) {
     const k = v[i]; const n = v[i + 1];
@@ -35,6 +43,8 @@ const ARGS = (() => {
     else if (k === '--opencode') { a.opencode = parsePairs(n); i++; }
     else if (k === '--claude') { a.claude = parsePairs(n); i++; }
     else if (k === '--only') { a.only = n.split(','); i++; }
+    else if (k === '--overlay') { a.overlay = n; i++; }
+    else if (k === '--overlay-files') { a.overlayFiles = n.split(',').filter(Boolean); i++; }
   }
   return a;
 })();
@@ -47,7 +57,15 @@ function parsePairs(s) {
 if (!ARGS.app) { console.error('--app required'); process.exit(2); }
 fs.mkdirSync(ARGS.out, { recursive: true });
 
-const app = (rel) => require(path.join(ARGS.app, rel));
+// Overlay: the listed modules come from --overlay (their own relative requires resolve there);
+// packages such as @xterm/headless still come from the app's node_modules (NODE_PATH).
+if (ARGS.overlay) {
+  process.env.NODE_PATH = [path.join(ARGS.app, 'node_modules'), process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
+  require('node:module')._initPaths();
+}
+const fromOverlay = (rel) => !!ARGS.overlay && ARGS.overlayFiles.includes(rel);
+const app = (rel) => require(path.join(fromOverlay(rel) ? ARGS.overlay : ARGS.app, rel));
+const appOpt = (rel) => { try { return app(rel); } catch (e) { return { loadError: String(e && e.message).slice(0, 300) }; } };
 const pty = app('node_modules/node-pty');
 const treeKill = app('platform/ptyTreeKill.cjs');
 const stormGuard = app('spawnStormGuard.cjs');
@@ -137,8 +155,13 @@ function spawnPane(file, argv, opts = {}) {
     ...(IS_WIN ? { useConpty: true } : {}),
   });
   const screen = paneScreen.createPaneScreen({ cols: opts.cols || 120, rows: opts.rows || 32 });
-  const state = { t, screen, bytes: 0, exit: null, startedAt: Date.now(), raw: '' };
-  t.onData((d) => { state.bytes += d.length; if (state.raw.length < 400000) state.raw += d; try { screen.write(d); } catch { /* reader fault */ } });
+  const rawCap = opts.rawCap || 400000;
+  const state = { t, screen, bytes: 0, exit: null, startedAt: Date.now(), raw: '', rawCapped: false };
+  t.onData((d) => {
+    state.bytes += d.length;
+    if (state.raw.length < rawCap) state.raw += d; else state.rawCapped = true;
+    try { screen.write(d); } catch { /* reader fault */ }
+  });
   t.onExit((e) => { state.exit = { code: e.exitCode, signal: e.signal || 0, ms: Date.now() - state.startedAt }; });
   return state;
 }
@@ -394,6 +417,18 @@ function dumpActive(s, name) {
     fs.writeFileSync(path.join(ARGS.out, `${name}.active.txt`), `${b.type}\n${rows.join('\n')}\n`);
   } catch { /* screen model gone */ }
 }
+// Raw pty stream + per-row wrap flags of the viewport: lets the screen be replayed exactly.
+function dumpRawAndWrap(s, name) {
+  try { fs.writeFileSync(path.join(ARGS.out, `${name}.raw.vt`), s.raw); } catch { /* disk */ }
+  try {
+    const b = s.screen.term.buffer.active;
+    const rows = [];
+    for (let i = b.baseY; i < b.length; i++) { const l = b.getLine(i); if (l) rows.push({ wrapped: !!l.isWrapped, text: l.translateToString(true) }); }
+    const wrapped = rows.filter((r) => r.wrapped).length;
+    fs.writeFileSync(path.join(ARGS.out, `${name}.wrap.json`), `${JSON.stringify({ type: b.type, cols: s.screen.term.cols, rows: rows.length, wrapped, raw_bytes: s.raw.length, raw_capped: s.rawCapped, lines: rows }, null, 1)}\n`);
+    return { rows: rows.length, wrapped, raw_bytes: s.raw.length, raw_capped: s.rawCapped };
+  } catch (e) { return { error: String(e && e.message).slice(0, 200) }; }
+}
 
 // ---------- opencode-start ----------
 // With an external plugin in its config, OpenCode waits for a dependency install into
@@ -530,10 +565,11 @@ async function scenarioOcReader() {
       try { plan = agentRunner.buildSpawn({ command: 'opencode', agentId: 'probe-reader', cwd: work, disallowSubagent: true }, env, ARGS.app, {}); } catch (e) { planErr = e.message; }
       const target = plan ? paneTarget(plan) : null;
       if (!target) { report(id, false, { plan_error: planErr, resolved: null }); continue; }
-      const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols, rows: 32 });
+      const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols, rows: 32, rawCap: 8 << 20 });
       const drawn = await waitFor(() => ocReady(s) || s.exit, 120000, 500);
       const drawnMs = drawn && !s.exit ? Date.now() - s.startedAt : null;
       await sleep(6000); // the status row (agent, model) settles after the box
+      const wrap = dumpRawAndWrap(s, id);
       const live = liveText(s);
       const reads = {};
       for (const [k, o] of [['plain', undefined], ['engine', { engine: 'opencode' }], ['ignoreRunning', { ignoreRunning: true }]]) {
@@ -551,7 +587,90 @@ async function scenarioOcReader() {
       report(id, !!reads.plain && reads.plain.verdict === 'empty', {
         expect: "reader says 'empty' on an idle input box (needed before the app writes a job)",
         version: versionOf(dir), cols, box_drawn_ms: drawnMs, alive_at_read: alive,
-        ghost, ghost_has_u2026: ghost.includes('…'), reads, leftover: left.map((p) => p.name),
+        ghost, ghost_has_u2026: ghost.includes('…'), reads, wrap, overlay: ARGS.overlay ? ARGS.overlayFiles : null, leftover: left.map((p) => p.name),
+      });
+    }
+  }
+}
+// ---------- ocdeliver ----------
+// The app writes a job into a pane only when its delivery gate says the pane is idle:
+// agentxDeliver.paneStateOf({bytes, buffer}) === 'idle', where buffer is the input box text
+// from the pane screen (paneScreen.composerLines). Here: a narrow, idle OpenCode pane, the
+// gate is polled for 30 s (the app polls the same way, much longer), and if it opens the app's
+// own writer (deliverPrompt) writes a job. The Enter key write is swallowed, so nothing is
+// sent to a model; the job must then be visible in the input box.
+async function scenarioOcDeliver() {
+  const xd = appOpt('agentxDeliver.cjs');
+  const dp = appOpt('deliverPrompt.cjs');
+  const widths = (process.env.PROBE_OCD_COLS || '45').split(',').map(Number).filter((n) => n >= 20 && n <= 300);
+  for (const { label, dir } of ARGS.opencode) {
+    for (const cols of widths) {
+      const id = `ocdeliver-${label}-c${cols}`;
+      if (xd.loadError || dp.loadError || typeof xd.paneStateOf !== 'function' || typeof dp.deliverPrompt !== 'function') {
+        report(id, false, { error: 'app delivery modules not loadable', agentxDeliver: xd.loadError || null, deliverPrompt: dp.loadError || null });
+        continue;
+      }
+      const home = isoHome(`ocd-${label}-${cols}`);
+      const work = path.join(home, 'work'); fs.mkdirSync(work);
+      const env = envFor(home, dir, {});
+      let plan = null; let planErr = null;
+      try { plan = agentRunner.buildSpawn({ command: 'opencode', agentId: 'probe-deliver', cwd: work, disallowSubagent: true }, env, ARGS.app, {}); } catch (e) { planErr = e.message; }
+      const target = plan ? paneTarget(plan) : null;
+      if (!target) { report(id, false, { plan_error: planErr, resolved: null }); continue; }
+      const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols, rows: 32, rawCap: 8 << 20 });
+      const drawn = await waitFor(() => ocReady(s) || s.exit, 120000, 500);
+      const drawnMs = drawn && !s.exit ? Date.now() - s.startedAt : null;
+      await sleep(6000);
+      const gateOf = () => {
+        const buffer = composerText(s);
+        let state = null; let diag = null;
+        try { state = xd.paneStateOf({ bytes: s.bytes, buffer }); } catch (e) { state = `error: ${String(e && e.message).slice(0, 120)}`; }
+        try { const d = composer.composerDiag(buffer, { ignoreRunning: true }); diag = { verdict: d.verdict, branch: d.branch }; } catch (e) { diag = { error: String(e && e.message).slice(0, 120) }; }
+        return { state, diag };
+      };
+      let gate = gateOf();
+      const gateEnd = Date.now() + 30000;
+      while (gate.state !== 'idle' && Date.now() < gateEnd && !s.exit) { await sleep(1000); gate = gateOf(); }
+      const before = composerText(s);
+      fs.writeFileSync(path.join(ARGS.out, `${id}.before.txt`), `${before}\n`);
+      const job = `OCDELIVER probe job ${label} ${cols}`;
+      const writes = []; let swallowedEnters = 0; let result = null; let deliverErr = null;
+      if (gate.state === 'idle') {
+        const io = {
+          readPaneBuffer: () => composerText(s),
+          writePane: (_id, data) => {
+            if (data === '\r' || data === '\r\n') { swallowedEnters += 1; return true; }
+            writes.push(data.length); s.t.write(data); return true;
+          },
+          sleep, now: () => Date.now(), livePaneCount: () => 1, platform: process.platform,
+          bracketedPasteMode: () => { const on = s.raw.lastIndexOf('\x1b[?2004h'); return on < 0 ? null : on > s.raw.lastIndexOf('\x1b[?2004l'); },
+          log: () => {},
+        };
+        try {
+          result = await Promise.race([
+            dp.deliverPrompt(id, job, { mode: 'auto', label: 'probe', bracketed: 'always', a4: true }, io),
+            sleep(60000).then(() => ({ outcome: 'probe-timeout' })),
+          ]);
+        } catch (e) { deliverErr = String(e && e.message).slice(0, 300); }
+        await sleep(3000);
+      }
+      const after = activeText(s);
+      fs.writeFileSync(path.join(ARGS.out, `${id}.after.txt`), `${after}\n`);
+      const jobOnScreen = after.replace(/\s+/g, ' ').includes(job);
+      const wrap = dumpRawAndWrap(s, id);
+      dumpActive(s, `${id}-end`);
+      const alive = !s.exit;
+      const kids = alive ? descendants(s.t.pid) : [];
+      if (alive) treeKill.killPaneTreesSync([s.t]);
+      await waitFor(() => s.exit, 10000);
+      await sleep(2000);
+      const left = stillAlive(kids); reap(left);
+      report(id, gate.state === 'idle' && writes.length > 0 && jobOnScreen, {
+        expect: 'the app\'s gate opens on the idle narrow pane and the app\'s writer puts the job in the input box',
+        version: versionOf(dir), cols, box_drawn_ms: drawnMs, alive_at_gate: alive, gate,
+        wrote: writes.length > 0, write_sizes: writes, enter_swallowed: swallowedEnters,
+        deliver: result ? { outcome: result.outcome, reason: result.reason, wroteText: result.wroteText } : null, deliver_error: deliverErr,
+        job_on_screen: jobOnScreen, wrap, overlay: ARGS.overlay ? ARGS.overlayFiles : null, leftover: left.map((p) => p.name),
       });
     }
   }
@@ -677,7 +796,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['claude', scenarioClaude]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
