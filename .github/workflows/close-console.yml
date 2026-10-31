@@ -1,0 +1,103 @@
+# REPO RULE: no app source code and no unreleased build ever goes into this repo.
+# Only a PUBLISHED installer (downloaded, sha256 checked) + test scripts.
+#
+# Windows close-console check for the public AgentSpace installer.
+#
+# Does a visible console window open when AgentSpace closes? Installs a PUBLISHED
+# installer on throwaway GitHub-hosted Windows runners, closes the app like a user
+# (WM_CLOSE), and counts the new console windows (window list every 25 ms + process
+# creation audit). The app's own modules are then run in Node mode with the shipped
+# spawn options (control) and with the fix branch's options (see scripts/closeConsole.ps1).
+#
+# Security notes:
+# - Manual trigger only (workflow_dispatch = users with write access to this repo).
+#   No push / pull_request / pull_request_target / issue_comment triggers.
+# - No secrets. GITHUB_TOKEN is read-only and is not used for the download.
+# - Inputs reach the shell only through env vars and are checked against strict patterns.
+# - Actions are pinned to full commit SHAs.
+# - Window captures are of the new console window's own content only, never the desktop.
+name: windows close console
+
+run-name: close console ${{ inputs.tag }} ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag in agentspace-releases (e.g. v0.4.8)'
+        required: true
+        type: string
+      asset:
+        description: 'Installer file name (e.g. AgentSpace-Setup-0.4.8.exe)'
+        required: true
+        type: string
+      sha256:
+        description: 'Expected sha256 of the installer (64 hex chars)'
+        required: true
+        type: string
+      request_id:
+        description: 'Shown in the run name only, so the caller can find its run (not used by any step)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-close-console-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  close-console:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: download installer + check sha256
+        env:
+          CC_TAG: ${{ inputs.tag }}
+          CC_ASSET: ${{ inputs.asset }}
+          CC_SHA256: ${{ inputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CC_TAG -cnotmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Write-Host "::error::bad tag"; exit 1 }
+          if ($env:CC_ASSET -cnotmatch '^AgentSpace-Setup-[0-9A-Za-z.-]+\.exe$') { Write-Host "::error::bad asset name"; exit 1 }
+          $want = $env:CC_SHA256.Trim().ToLower()
+          if ($want -cnotmatch '^[0-9a-f]{64}$') { Write-Host "::error::bad sha256"; exit 1 }
+          $url = "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$($env:CC_TAG)/$($env:CC_ASSET)"
+          New-Item -ItemType Directory -Force -Path cc-input | Out-Null
+          $dst = Join-Path 'cc-input' $env:CC_ASSET
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          $got = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          $bytes = (Get-Item $dst).Length
+          "$got  $bytes  $($env:CC_ASSET)"
+          if ($got -ne $want) { Write-Host "::error::sha256 mismatch: expected $want, got $got"; exit 1 }
+          "| installer | ``$($env:CC_ASSET)`` @ $($env:CC_TAG) · $bytes bytes · sha256 ``$got`` |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: close console check (real close + probe arms)
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/closeConsole.ps1 -Dist cc-input -OutDir close-console
+
+      - name: upload evidence (window list, 4688 spawns, window captures, json)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: close-console-${{ matrix.runner }}-${{ github.run_id }}
+          path: close-console
+          if-no-files-found: warn
+          retention-days: 7

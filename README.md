@@ -20,6 +20,7 @@ throwaway GitHub-hosted runner.
 | `smoke.yml` | windows-latest | Windows install → launch → close → uninstall |
 | `engines.yml` | windows-latest | engine panes (Codex, OpenCode, Claude Code) with the installed app's own modules |
 | `seal.yml` | macos-15, macos-26, windows-2025 | bundle seal: does the running app write into its own bundle / install folder? macOS: codesign + spctl + file list before and after walking every page in the app window, relaunch, launch with the quarantine flag; Windows: a read-only (Program Files style) copy must run without write errors. `expect=broken` is the control for a release known to have the problem |
+| `close-console.yml` | windows-2022, windows-2025, windows-11-arm | close console: does a visible console window open when the app closes? Window list every 25 ms + process creation audit (4688) during a real close (WM_CLOSE), then the app's own spawn code in Node mode with the shipped options (control) and with the fix's options. Captures are of the new console window only |
 
 ```
 gh workflow run clean-profile.yml -R muratbaskicioglu/agentspace-win-smoke \
