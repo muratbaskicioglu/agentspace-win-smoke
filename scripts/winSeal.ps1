@@ -239,11 +239,15 @@ $LASTEXITCODE = 0
 # "Access is denied". Now the copy keeps the Program Files ACL it inherits (Users RX,
 # Administrators/SYSTEM/TrustedInstaller F, app packages RX) and an inheritable DENY for
 # Everyone blocks write data/add file (WD), append/add folder (AD), delete child (DC) and
-# delete (D). A deny beats the Administrators allow, so the elevated runner account is
-# held to read+execute like a standard user. Not "W": that set holds SYNCHRONIZE, which
-# every open of the file (and process start) also asks for.
-$acl = & icacls $dirB /deny '*S-1-1-0:(OI)(CI)(WD,AD,DC,D)' /C /Q 2>&1
+# delete (DE). A deny beats the Administrators allow, so the elevated runner account is
+# held to read+execute like a standard user. Only specific rights: the simple rights "W"
+# and "D" both hold SYNCHRONIZE, which every open, folder listing and process start also
+# asks for. Run 2 used "D" and the folder could not even be listed (exe not found).
+$acl = & icacls $dirB /deny '*S-1-1-0:(OI)(CI)(WD,AD,DC,DE)' /C /Q 2>&1
 $exeB = Find-Exe $dirB
+$listErr = ''
+if (-not $exeB) { try { $n = @(Get-ChildItem -LiteralPath $dirB -Force -ErrorAction Stop).Count; $listErr = "listed $n entries, no AgentSpace*.exe" } catch { $listErr = "list refused: $($_.Exception.GetType().Name): $($_.Exception.Message)" } }
+$dirAcl = ((& icacls $dirB 2>&1) | Where-Object { "$_".Trim() } | ForEach-Object { "$_".Trim() }) -join ' | '
 $probeDir = Join-Path $dirB 'resources\standalone\.next\server'
 $denied = [ordered]@{}
 $existing = Join-Path $dirB 'resources\standalone\server.js'
@@ -259,9 +263,11 @@ foreach ($t in @(@{ k = 'file'; p = (Join-Path $probeDir 'seal-write-probe.txt')
 # the exe must stay readable + startable: read it, ask Windows what the ACL is
 $exeRead = 'no exe'
 if ($exeB) { try { $fs = [IO.File]::OpenRead($exeB); $exeRead = "read ok ($($fs.Length) bytes)"; $fs.Dispose() } catch { $exeRead = "read refused: $($_.Exception.Message)" } }
+# reads of a bundle file must still work (the refusals above must come from the deny, not a broken open)
+$readExisting = $(try { "read ok ($([IO.File]::ReadAllBytes($existing).Length) bytes)" } catch { "read refused: $($_.Exception.Message)" })
 $exeAcl = $(if ($exeB) { ((& icacls $exeB 2>&1) | Where-Object { "$_".Trim() } | ForEach-Object { "$_".Trim() }) -join ' | ' } else { '' })
-$roOk = ($denied.file -like 'refused*') -and ($denied.folder -like 'refused*') -and ($denied.overwrite -like 'refused*') -and [bool]$exeB -and ($exeRead -like 'read ok*')
-Step 'read-only copy' $(if ($roOk) { 'pass' } else { 'unmeasured' }) ([ordered]@{ dir = $dirB; exe = $exeB; icacls = (($acl | Select-Object -Last 1) -as [string]); exe_acl = $exeAcl; exe_read = $exeRead; test_write = $denied; whoami = (& whoami) })
+$roOk = ($denied.file -like 'refused*') -and ($denied.folder -like 'refused*') -and ($denied.overwrite -like 'refused*') -and [bool]$exeB -and ($exeRead -like 'read ok*') -and ($readExisting -like 'read ok*')
+Step 'read-only copy' $(if ($roOk) { 'pass' } else { 'unmeasured' }) ([ordered]@{ dir = $dirB; exe = $exeB; list_error = $listErr; icacls = (($acl | Select-Object -Last 1) -as [string]); dir_acl = $dirAcl; exe_acl = $exeAcl; exe_read = $exeRead; read_existing = $readExisting; test_write = $denied; whoami = (& whoami) })
 if (-not $roOk) { Finish }
 
 # -- A) per-user folder (writable) -----------------------------------------------
