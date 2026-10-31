@@ -16,6 +16,7 @@
 //   codex     real Codex TUI: empty input box read by the app's reader, then typed text
 //   opencode  real OpenCode pane with the app's own argv/env: alive after 25 s? leftovers?
 //   claude    real Claude Code pane built like the app's main process: alive? what did it print?
+//   ocreader  idle OpenCode input box (wide + narrow): what does the app's own reader say?
 'use strict';
 const fs = require('node:fs');
 const os = require('node:os');
@@ -512,6 +513,49 @@ async function scenarioOpencode() {
     }
   }
 }
+// ---------- ocreader ----------
+// An idle OpenCode pane started the way the app starts it. Once the input box is drawn,
+// the app's own input box reader (leaderComposer.composerDiag) says what it sees. The app
+// writes a job into a pane only when the reader says 'empty'. Two widths: wide (120) and
+// narrow (45 and 36 columns, about a medium and a small pane). No key, no login: OpenCode uses its free default.
+async function scenarioOcReader() {
+  const widths = (process.env.PROBE_OCR_COLS || '120,45,36').split(',').map(Number).filter((n) => n >= 20 && n <= 300);
+  for (const { label, dir } of ARGS.opencode) {
+    for (const cols of widths) {
+      const id = `ocreader-${label}-c${cols}`;
+      const home = isoHome(`ocr-${label}-${cols}`);
+      const work = path.join(home, 'work'); fs.mkdirSync(work);
+      const env = envFor(home, dir, {});
+      let plan = null; let planErr = null;
+      try { plan = agentRunner.buildSpawn({ command: 'opencode', agentId: 'probe-reader', cwd: work, disallowSubagent: true }, env, ARGS.app, {}); } catch (e) { planErr = e.message; }
+      const target = plan ? paneTarget(plan) : null;
+      if (!target) { report(id, false, { plan_error: planErr, resolved: null }); continue; }
+      const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols, rows: 32 });
+      const drawn = await waitFor(() => ocReady(s) || s.exit, 120000, 500);
+      const drawnMs = drawn && !s.exit ? Date.now() - s.startedAt : null;
+      await sleep(6000); // the status row (agent, model) settles after the box
+      const live = liveText(s);
+      const reads = {};
+      for (const [k, o] of [['plain', undefined], ['engine', { engine: 'opencode' }], ['ignoreRunning', { ignoreRunning: true }]]) {
+        try { const d = composer.composerDiag(live, o); reads[k] = { verdict: d.verdict, branch: d.branch, row: d.row }; } catch (e) { reads[k] = { error: String(e && e.message).slice(0, 200) }; }
+      }
+      const ghost = (live.match(/Ask anything[^\n]{0,60}/) || [''])[0];
+      saveScreen(id, s);
+      dumpActive(s, id);
+      const alive = !s.exit;
+      const before = alive ? descendants(s.t.pid) : [];
+      if (alive) treeKill.killPaneTreesSync([s.t]);
+      await waitFor(() => s.exit, 10000);
+      await sleep(2000);
+      const left = stillAlive(before); reap(left);
+      report(id, !!reads.plain && reads.plain.verdict === 'empty', {
+        expect: "reader says 'empty' on an idle input box (needed before the app writes a job)",
+        version: versionOf(dir), cols, box_drawn_ms: drawnMs, alive_at_read: alive,
+        ghost, ghost_has_u2026: ghost.includes('…'), reads, leftover: left.map((p) => p.name),
+      });
+    }
+  }
+}
 // ---------- claude ----------
 // A real Claude Code pane started exactly like the app's main process does: buildSpawn
 // with the app's identity-file sink (spawnPromptFile.createSink), then the Windows
@@ -633,7 +677,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['claude', scenarioClaude]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['claude', scenarioClaude]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }

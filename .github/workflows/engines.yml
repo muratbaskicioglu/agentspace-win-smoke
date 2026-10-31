@@ -39,6 +39,11 @@ on:
         required: false
         type: string
         default: ''
+      opencode_extra:
+        description: 'Extra OpenCode versions to probe next to the pinned one, space separated (e.g. 1.19.5; empty = none)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -102,6 +107,8 @@ jobs:
           "AS_ASAR=$asar" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: install engines from npm (pinned)
+        env:
+          OPENCODE_EXTRA: ${{ inputs.opencode_extra }}
         run: |
           $ErrorActionPreference = 'Stop'
           $pairs = @()
@@ -129,7 +136,15 @@ jobs:
           if (-not (Test-Path (Join-Path $cdir 'claude.cmd'))) { throw "npm claude not installed" }
           "PROBE_CLAUDE=native=$native,npm=$cdir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "PROBE_CODEX=$($pairs -join ',')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "PROBE_OPENCODE=g=$g" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $oc = @("g=$g")
+          foreach ($v in ("$env:OPENCODE_EXTRA".Trim() -split '\s+' | Where-Object { $_ })) {
+            if ($v -cnotmatch '^\d+\.\d+\.\d+$') { throw "bad opencode version $v" }
+            $dir = "C:\probe\opencode-$v"
+            npm install --global --no-audit --no-fund --prefix $dir "opencode-ai@$v" | Out-Host
+            if (-not (Test-Path (Join-Path $dir 'opencode.cmd'))) { throw "opencode $v not installed" }
+            $oc += "v$($v.Replace('.', ''))=$dir"
+          }
+          "PROBE_OPENCODE=$($oc -join ',')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           node --version
 
       - name: engine probe (app's own modules, real ConPTY)
