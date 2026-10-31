@@ -19,6 +19,7 @@ throwaway GitHub-hosted runner.
 | `clean-profile.yml` | macos-15, macos-26, xcode-27 (macOS 27 preview), macos-15-intel, windows-11-arm, windows-2025 | clean profile: install → first launch to the sign-in screen → close → uninstall, a frame per window step; the Antigravity hook command and the memory brake, run with the installed app's own code |
 | `smoke.yml` | windows-latest | Windows install → launch → close → uninstall |
 | `engines.yml` | windows-latest | engine panes (Codex, OpenCode, Claude Code) with the installed app's own modules |
+| `seal.yml` | macos-15, macos-26, windows-2025 | bundle seal: does the running app write into its own bundle / install folder? macOS: codesign + spctl + file list before and after walking every page in the app window, relaunch, launch with the quarantine flag; Windows: a read-only (Program Files style) copy must run without write errors. `expect=broken` is the control for a release known to have the problem |
 
 ```
 gh workflow run clean-profile.yml -R muratbaskicioglu/agentspace-win-smoke \
@@ -26,6 +27,11 @@ gh workflow run clean-profile.yml -R muratbaskicioglu/agentspace-win-smoke \
 
 gh workflow run smoke.yml -R muratbaskicioglu/agentspace-win-smoke \
   -f tag=v0.3.3 -f asset=AgentSpace-Setup-0.3.3.exe -f sha256=<sha256>
+```
+
+```
+gh workflow run seal.yml -R muratbaskicioglu/agentspace-win-smoke \
+  -f tag=v0.4.8 -f expect=broken -f mac_arm64_sha256=<sha256> -f win_sha256=<sha256>
 ```
 
 `clean-profile.yml` is the release gate: the AgentSpace release script starts it
