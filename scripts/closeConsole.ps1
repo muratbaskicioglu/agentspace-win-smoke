@@ -267,8 +267,10 @@ function Stop-Watch {
     }
   })
 }
-function Count-Console($wins) { return @($wins | Where-Object { $_.console -and -not $_.cloaked }).Count }
-function Count-Visible($wins) { return @($wins | Where-Object { -not $_.cloaked }).Count }
+# An empty window list must count as 0 (a `$null` piped into Where-Object runs once, and StrictMode
+# then stops the script on the missing property), so callers wrap Stop-Watch in @() and these skip `$null.
+function Count-Console($wins) { return @(@($wins) | Where-Object { $null -ne $_ -and $_.console -and -not $_.cloaked }).Count }
+function Count-Visible($wins) { return @(@($wins) | Where-Object { $null -ne $_ -and -not $_.cloaked }).Count }
 
 # Watchdog helpers still running that were created after $since (cmd / ping / taskkill
 # whose command line is the watchdog's), so unrelated system processes do not count.
@@ -368,7 +370,7 @@ for ($i = 1; $i -le $Closes; $i++) {
     if ($pb.MainWindowHandle -ne [IntPtr]::Zero -and $pb.MainWindowTitle) { $handle = $pb.MainWindowHandle; break }
   }
   Start-Sleep -Seconds 10   # let the app finish starting (server, renderer, probes)
-  $launchWins = Stop-Watch
+  $launchWins = @(Stop-Watch)
   if ($handle -eq [IntPtr]::Zero -or $pb.HasExited) {
     Add-Arm ([ordered]@{ name = $tag; kind = 'control'; ok = $false; console_windows = 0; new_visible_windows = 0; windows = @(); spawns = @(); note = 'main window did not appear; close not measured' })
     Get-Descendants $pb.Id (Get-Procs) | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -381,10 +383,10 @@ for ($i = 1; $i -le $Closes; $i++) {
   $exited = $pb.WaitForExit($CloseTimeoutSec * 1000)
   $closeSec = [math]::Round(((Get-Date) - $c0).TotalSeconds, 1)
   Start-Sleep -Seconds 1
-  $early = Get-Leftovers $c0
+  $early = @(Get-Leftovers $c0)
   Start-Sleep -Seconds $AfterSec
-  $wins = Stop-Watch
-  $late = Get-Leftovers $c0
+  $wins = @(Stop-Watch)
+  $late = @(Get-Leftovers $c0)
   $spawnsAll = Get-Spawns $launchAt
   $atClose = Select-Tree $spawnsAll ([int64]$pb.Id) $c0
   $atLaunch = Select-Tree $spawnsAll ([int64]$pb.Id) $launchAt
@@ -420,10 +422,10 @@ foreach ($case in $cases.Keys) {
   $done = $pp.WaitForExit(40000)
   $exitAt = Get-Date
   Start-Sleep -Seconds 1
-  $early = Get-Leftovers $t0
+  $early = @(Get-Leftovers $t0)
   Start-Sleep -Seconds $AfterSec
-  $wins = Stop-Watch
-  $late = Get-Leftovers $t0
+  $wins = @(Stop-Watch)
+  $late = @(Get-Leftovers $t0)
   $spawns = Select-Tree (Get-Spawns $t0) ([int64]$pp.Id) $t0
   $pj = $null; if (Test-Path $json) { $pj = Get-Content -Raw $json | ConvertFrom-Json }
   $cw = Count-Console $wins; $nv = Count-Visible $wins
