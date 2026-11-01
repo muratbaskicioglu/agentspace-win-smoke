@@ -22,6 +22,11 @@
 //   ocdeliver idle NARROW OpenCode pane: does the app's own delivery gate (agentxDeliver.paneStateOf)
 //             let a job through, and does the app's own writer (deliverPrompt) put it in the input
 //             box? Enter is NOT sent (it would reach a model): the Enter key write is swallowed.
+//   agyping   Antigravity sign-in check with a FAKE agy binary (no account, nothing reaches Google):
+//             the app's own engineAuthGate runs its one-shot check, then the app's own status row
+//             (decorateStatus) is read. Measured: exactly one check per click, the reason class,
+//             the engine's own line with the home folder / e-mail / token masked (made-up names
+//             only), the same row for settings and setup, and "signed in" -> "connected" on success.
 //
 // --overlay <dir> --overlay-files a.cjs,b.cjs: load those app modules from <dir> instead of the
 // app (used by a private test run to compare a fix with the shipped code; never used here).
@@ -785,6 +790,111 @@ async function scenarioClaude() {
   }
 }
 
+// ---------- agyping ----------
+// Antigravity "signed in -> connected" check, run by the app's own engineAuthGate with a FAKE
+// agy binary: a .cmd shim (like an npm-installed CLI) that prints a canned answer to `-p` and
+// counts its calls. No account, no network, nothing reaches Google. The app's binary override
+// (AGENTSPACE_FAKE_ENGINE_BIN) points the gate at the fake. Each arm has its own made-up home
+// (USERPROFILE), so the home folder in the fake's error line is a real Windows path built by
+// the OS (os.homedir()), with a space and non-ASCII letters in the user name.
+// All names are MADE UP (Ayşe Örnekoğlu, ayse.ornek@example.com); the token is not a real token.
+const AGY_ARMS = {
+  ok: { user: 'Ayse', lines: null, expect: 'bagli' },
+  D0: { user: 'Ayse', home: true, lines: (h) => [`Loading credentials from ${h}\\.gemini\\antigravity-cli\\oauth.json`, `Error: 403 PERMISSION_DENIED: The caller does not have permission (account ayse.ornek@example.com) at ${h}\\.gemini\\antigravity-cli\\oauth.json`], forbid: ['Ayse', 'ayse.ornek@example.com'] },
+  D1: { user: 'Ayşe Örnekoğlu', home: true, lines: (h) => [`Error: 403 PERMISSION_DENIED: cannot read ${h}\\.gemini\\antigravity-cli\\oauth.json`], forbid: ['Ayşe', 'Örnekoğlu'] },
+  D2: { user: 'Ayşe Örnekoğlu', home: true, lines: (h) => [JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED', path: `${h}\\.gemini\\antigravity-cli\\oauth.json` } })], forbid: ['Ayşe', 'Örnekoğlu'] },
+  D3: { user: 'Ayse', lines: () => ['\u001b[2K\rConnecting... \rConnecting... ', '\u001b[33mwarning\u001b[0m: telemetry disabled', '\u001b[31mError: 401 UNAUTHENTICATED\u001b[0m Authorization: Bearer ya29.a0AfB_byC9xQ7mZ-ExampleOnly_NotARealToken_4f3e2d1c0b9a8 for Ayse.Ornek+AGY@Example.COM'], forbid: ['ya29.a0AfB_byC9xQ7mZ-ExampleOnly_NotARealToken_4f3e2d1c0b9a8', 'Ayse.Ornek+AGY@Example.COM', 'Ornek+AGY'] },
+  // The OS builds the line: Node's own ENOENT message for the credentials file under the home.
+  D4: { user: 'Ayşe Örnekoğlu', home: true, lines: 'os-error', forbid: ['Ayşe', 'Örnekoğlu'] },
+};
+function fakeAgy(dir) {
+  const js = path.join(dir, 'fake-agy.js');
+  fs.writeFileSync(js, `'use strict';
+const fs = require('fs'); const os = require('os'); const path = require('path');
+const a = process.argv.slice(2);
+try { fs.appendFileSync(process.env.AGY_FAKE_CALLS, JSON.stringify({ at: Date.now(), argv0: a[0] || '' }) + '\\n'); } catch {}
+if (a[0] === '--version' || a[0] === '-v') { process.stdout.write('1.1.28\\n'); process.exit(0); }
+if (a[0] === 'models') { process.stdout.write('gemini-3-pro\\n'); process.exit(0); }
+if (a[0] !== '-p') { process.stderr.write('fake agy: interactive start not supported\\n'); process.exit(2); }
+const mode = process.env.AGY_FAKE_MODE;
+if (mode === 'ok') { process.stdout.write('OK\\n'); process.exit(0); }
+if (mode === 'os-error') {
+  try { fs.readFileSync(path.join(os.homedir(), '.gemini', 'antigravity-cli', 'oauth.json')); }
+  catch (e) { process.stderr.write('Error: not logged in: ' + e.message + '\\n'); }
+  process.exit(1);
+}
+for (const l of JSON.parse(process.env.AGY_FAKE_LINES || '[]')) process.stderr.write(l + '\\n');
+process.exit(1);
+`);
+  const node = process.env.PROBE_NODE || 'node';
+  if (IS_WIN) {
+    const cmd = path.join(dir, 'agy.cmd');
+    fs.writeFileSync(cmd, `@echo off\r\n"${node}" "%~dp0fake-agy.js" %*\r\n`);
+    return cmd;
+  }
+  const sh = path.join(dir, 'agy');
+  fs.writeFileSync(sh, `#!/bin/sh\nexec "${node}" "$(dirname "$0")/fake-agy.js" "$@"\n`, { mode: 0o755 });
+  return sh;
+}
+async function scenarioAgyPing() {
+  const gate = appOpt('engineAuthGate.cjs');
+  if (gate.loadError || typeof gate.verifyEngine !== 'function' || typeof gate.decorateStatus !== 'function') {
+    report('agyping-load', false, { error: 'engineAuthGate not loadable', loadError: gate.loadError || null });
+    return;
+  }
+  const binDir = isoHome('agy-bin');
+  const bin = fakeAgy(binDir);
+  for (const [arm, spec] of Object.entries(AGY_ARMS)) {
+    const id = `agyping-${arm}`;
+    const box = isoHome(`agy-${arm}`);
+    const calls = path.join(box, 'calls.jsonl');
+    // The fake's home (what os.homedir() returns in it) is this platform's; the canned lines
+    // always carry the Windows form, as a Windows engine prints them.
+    const home = IS_WIN ? `C:\\Users\\${spec.user}` : `/Users/${spec.user}`;
+    const lines = typeof spec.lines === 'function' ? spec.lines(`C:\\Users\\${spec.user}`) : [];
+    const env = {
+      ...process.env, USERPROFILE: home, HOME: home,
+      APPDATA: path.join(box, 'AppData', 'Roaming'), LOCALAPPDATA: path.join(box, 'AppData', 'Local'),
+      AGENTSPACE_FAKE_ENGINE_BIN: '1', AGENTSPACE_ENGINE_BIN_ANTIGRAVITY: bin,
+      AGY_FAKE_CALLS: calls, AGY_FAKE_MODE: spec.lines === 'os-error' ? 'os-error' : arm === 'ok' ? 'ok' : 'lines',
+      AGY_FAKE_LINES: JSON.stringify(lines),
+    };
+    // The status row the app reads before the check: installed, signed in, not checked yet.
+    const row = { engine: 'antigravity', installed: true, loggedIn: true, flow: 'external' };
+    const deps = { env, statusRow: row, cwd: box, probeTimeoutMs: 60000, platform: process.platform };
+    let before = null; let res = null; let after = null; let after2 = null; let err = null;
+    try {
+      gate.forgetVerification('antigravity');
+      before = gate.decorateStatus(row, deps);
+      res = await gate.verifyEngine('antigravity', deps);
+      after = gate.decorateStatus(row, deps);
+      await sleep(3000); // idle: no new check may start by itself
+      after2 = gate.decorateStatus(row, deps);
+    } catch (e) { err = String(e && e.stack || e).slice(0, 1200); }
+    const nCalls = (() => { try { return fs.readFileSync(calls, 'utf8').split('\n').filter(Boolean).filter((l) => JSON.parse(l).argv0 === '-p').length; } catch { return 0; } })();
+    const pick = (o) => (o ? { kurulumDurumu: o.kurulumDurumu, verified: o.verified, verifyUntried: o.verifyUntried, verifyError: o.verifyError, verifyReason: o.verifyReason, verifyDetail: o.verifyDetail } : null);
+    const shown = (after && after.verifyDetail) || '';
+    const leaked = (spec.forbid || []).filter((w) => shown.includes(w) || (res && String(res.satir || '').includes(w)));
+    let pass; let expect;
+    if (arm === 'ok') {
+      expect = "before 'girisli' (untried), one check, then 'bagli' with no error";
+      pass = !err && before && before.kurulumDurumu === 'girisli' && before.verifyUntried === true
+        && res && res.verified === true && after && after.kurulumDurumu === 'bagli' && after.verified === true && !after.verifyError && nCalls === 1;
+    } else {
+      expect = "one check; reason 'ret'; engine line shown with the home folder -> ~ (arms with a path) and e-mail/token masked; settings row == setup row; no new check when idle";
+      pass = !err && res && res.verified === false && res.neden === 'ret' && nCalls === 1
+        && after && after.verified === false && after.verifyReason === res.neden && after.verifyDetail === res.satir && after.verifyError === res.error
+        && !!res.satir && leaked.length === 0 && (!spec.home || /~/.test(res.satir)) && !/\u001b/.test(res.satir)
+        && JSON.stringify(pick(after)) === JSON.stringify(pick(after2));
+    }
+    report(id, !!pass, {
+      expect, user_dir: arm === 'ok' ? null : (spec.user.includes(' ') ? 'spaced, non-ASCII' : 'plain'),
+      checks_run: nCalls, result: res ? { verified: res.verified, error: res.error, neden: res.neden, satir: res.satir } : null,
+      before: pick(before), after: pick(after), after_idle: pick(after2), leaked, error: err,
+    });
+  }
+}
+
 function versionOf(binDir) {
   try {
     const pkg = path.join(binDir, IS_WIN ? '' : '..', 'lib', 'node_modules', 'opencode-ai', 'package.json');
@@ -796,7 +906,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude], ['agyping', scenarioAgyPing]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
