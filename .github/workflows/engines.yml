@@ -39,6 +39,16 @@ on:
         required: false
         type: string
         default: ''
+      claude_version:
+        description: 'Claude Code version to install (empty = the pinned one)'
+        required: false
+        type: string
+        default: ''
+      cld_cols:
+        description: 'cldeliver pane widths, comma separated (empty = 120,60)'
+        required: false
+        type: string
+        default: ''
       opencode_extra:
         description: 'Extra OpenCode versions to probe next to the pinned one, space separated (e.g. 1.19.5; empty = none)'
         required: false
@@ -109,8 +119,10 @@ jobs:
       - name: install engines from npm (pinned)
         env:
           OPENCODE_EXTRA: ${{ inputs.opencode_extra }}
+          CLAUDE_WANT: ${{ inputs.claude_version }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ("$env:CLAUDE_WANT".Trim()) { $env:CLAUDE_VERSION = "$env:CLAUDE_WANT".Trim() }
           $pairs = @()
           foreach ($v in $env:CODEX_VERSIONS.Split(' ')) {
             if ($v -cnotmatch '^\d+\.\d+\.\d+$') { throw "bad version $v" }
@@ -150,8 +162,11 @@ jobs:
       - name: engine probe (app's own modules, real ConPTY)
         env:
           PROBE_ONLY: ${{ inputs.only }}
+          PROBE_CLD_COLS: ${{ inputs.cld_cols }}
         run: |
           if ($env:PROBE_ONLY -cnotmatch '^[a-z,]*$') { Write-Host "::error::bad scenario list"; exit 1 }
+          if ($env:PROBE_CLD_COLS -cnotmatch '^[0-9,]*$') { Write-Host "::error::bad width list"; exit 1 }
+          if (-not $env:PROBE_CLD_COLS) { Remove-Item Env:PROBE_CLD_COLS -ErrorAction SilentlyContinue }
           $out = Join-Path $PWD 'engine-probe'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $env:ELECTRON_RUN_AS_NODE = '1'

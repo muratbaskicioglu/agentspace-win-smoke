@@ -22,6 +22,8 @@
 //   ocdeliver idle NARROW OpenCode pane: does the app's own delivery gate (agentxDeliver.paneStateOf)
 //             let a job through, and does the app's own writer (deliverPrompt) put it in the input
 //             box? Enter is NOT sent (it would reach a model): the Enter key write is swallowed.
+//   cldeliver idle Claude Code pane (fresh / after /model / after a typed line, several widths):
+//             does the app's own delivery gate read it idle, and does the app's writer put a job in?
 //   agyping   Antigravity sign-in check with a FAKE agy binary (no account, nothing reaches Google):
 //             the app's own engineAuthGate runs its one-shot check, then the app's own status row
 //             (decorateStatus) is read. Measured: exactly one check per click, the reason class,
@@ -790,6 +792,111 @@ async function scenarioClaude() {
   }
 }
 
+// ---------- cldeliver ----------
+// The leader's pane is a real Claude Code pane. The app writes a team-chat job into it only
+// when its delivery gate reads the pane as idle: agentxDeliver.paneStateOf({bytes, buffer,
+// ghost}) === 'idle', buffer = paneScreen.composerLines(). Measured per width and per screen:
+//   idle         fresh session, empty input box
+//   after-model  the user ran /model and kept the current model (local picker, no model call)
+//   after-reply  the user typed a line in the pane itself (the FAKE key is rejected: an error line)
+// For each: the gate state (with and without the Windows ghost context the app passes when
+// nobody touched the box), the reader's verdict + branch, the bottom rows of the box, the wrap
+// flags, and the raw pty stream for replay. On 'idle' the app's own writer (deliverPrompt) puts
+// a job in the box; the Enter key write is swallowed, so nothing is sent.
+async function scenarioClDeliver() {
+  const xd = appOpt('agentxDeliver.cjs');
+  const dp = appOpt('deliverPrompt.cjs');
+  const widths = (process.env.PROBE_CLD_COLS || '120,60').split(',').map(Number).filter((n) => n >= 20 && n <= 300);
+  const wantArms = (process.env.PROBE_CLD_ARMS || 'idle,after-model,after-reply').split(',');
+  const wantLabels = process.env.PROBE_CLD_LABELS ? process.env.PROBE_CLD_LABELS.split(',') : null;
+  const gateOf = (s) => {
+    const buffer = composerText(s);
+    const out = {};
+    const st = (ghost) => { try { return xd.paneStateOf({ bytes: s.bytes, buffer, ...(ghost ? { ghost } : {}) }); } catch (e) { return `error: ${String(e && e.message).slice(0, 120)}`; } };
+    out.state = st(null);
+    out.state_ghost = IS_WIN ? st({ machineText: null }) : null;
+    const dg = (o) => { try { const d = composer.composerDiag(buffer, o); return { verdict: d.verdict, branch: d.branch, engine: d.engine || null }; } catch (e) { return { error: String(e && e.message).slice(0, 120) }; } };
+    out.diag = dg({ ignoreRunning: true });
+    out.diag_engine = dg({ ignoreRunning: true, engine: 'claude' });
+    out.tail = buffer.split('\n').slice(-8);
+    return out;
+  };
+  for (const { label, dir } of ARGS.claude) {
+    if (wantLabels && !wantLabels.includes(label)) continue;
+    for (const cols of widths) {
+      for (const arm of wantArms) {
+        const id = `cldeliver-${label}-c${cols}-${arm}`;
+        if (xd.loadError || typeof xd.paneStateOf !== 'function') { report(id, false, { error: 'agentxDeliver not loadable', detail: xd.loadError || null }); continue; }
+        const { home, work } = claudeHome(`cld-${label}-${cols}-${arm}`, true);
+        const env = envFor(home, dir, { ANTHROPIC_API_KEY: FAKE_ANTHROPIC, DISABLE_AUTOUPDATER: '1' });
+        let plan = null; let planErr = null;
+        withAppHome(home, () => {
+          let sink = null;
+          if (spawnPromptFile) { try { sink = spawnPromptFile.createSink({ engine: 'claude', bin: engineInstall.resolveBinary('claude', env), env, home: appDataDir(home), log: () => {} }); } catch { sink = null; } }
+          try { plan = agentRunner.buildSpawn({ command: 'claude', agentId: `probe-cld-${arm}`, cwd: work, disallowSubagent: true }, env, ARGS.app, sink ? { promptFile: sink } : {}); } catch (e) { planErr = String(e && e.message || e).slice(0, 300); }
+          if (plan && plan.trust && plan.trust.pending) { try { agentRunner.ensureEngineTrusted(plan.key, plan.cwd, plan.env); } catch { /* measured below */ } }
+        });
+        const target = plan ? paneTarget(plan) : null;
+        if (!target) { report(id, false, { plan_error: planErr, resolved: null }); continue; }
+        const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols, rows: 32, rawCap: 8 << 20 });
+        const box = () => /❯|Try "|for shortcuts|bypass permissions/.test(liveText(s));
+        await waitFor(() => s.exit || box(), 45000, 250);
+        const boxMs = box() ? Date.now() - s.startedAt : null;
+        await sleep(5000);
+        const steps = [];
+        if (!s.exit && arm === 'after-model') {
+          s.t.write('/model'); await sleep(1200); s.t.write('\r'); await sleep(3000);
+          steps.push({ at: 'picker-open', ...gateOf(s) });
+          s.t.write('\r'); await sleep(3000);
+        } else if (!s.exit && arm === 'after-reply') {
+          s.t.write('merhaba'); await sleep(800); s.t.write('\r'); await sleep(12000);
+        }
+        // Poll the gate like the app does (300 ms, here 20 s: the app's own fresh cap is 9 s).
+        let gate = gateOf(s); let firstIdleMs = gate.state === 'idle' ? 0 : null; const t0 = Date.now();
+        const seen = new Set([`${gate.state}|${gate.diag.verdict}|${gate.diag.branch}`]);
+        while (Date.now() - t0 < 20000 && !s.exit) {
+          await sleep(300); const g = gateOf(s);
+          seen.add(`${g.state}|${g.diag.verdict}|${g.diag.branch}`);
+          if (g.state === 'idle' && firstIdleMs == null) firstIdleMs = Date.now() - t0;
+          gate = g;
+        }
+        fs.writeFileSync(path.join(ARGS.out, `${id}.composer.txt`), `${composerText(s)}\n`);
+        fs.writeFileSync(path.join(ARGS.out, `${id}.screen.txt`), `${liveText(s)}\n`);
+        let deliver = null; let jobOnScreen = null; let swallowed = 0;
+        if (gate.state === 'idle' && arm === 'idle' && !dp.loadError && typeof dp.deliverPrompt === 'function') {
+          const job = `CLDELIVER probe job ${label} ${cols}`;
+          const io = {
+            readPaneBuffer: () => composerText(s),
+            writePane: (_id, data) => { if (data === '\r' || data === '\r\n') { swallowed += 1; return true; } s.t.write(data); return true; },
+            sleep, now: () => Date.now(), livePaneCount: () => 1, platform: process.platform,
+            bracketedPasteMode: () => { const on = s.raw.lastIndexOf('\x1b[?2004h'); return on < 0 ? null : on > s.raw.lastIndexOf('\x1b[?2004l'); },
+            log: () => {},
+          };
+          try {
+            const r = await Promise.race([dp.deliverPrompt(id, job, { mode: 'auto', label: 'probe', bracketed: 'always', a4: true }, io), sleep(60000).then(() => ({ outcome: 'probe-timeout' }))]);
+            deliver = { outcome: r && r.outcome, reason: r && r.reason };
+          } catch (e) { deliver = { error: String(e && e.message).slice(0, 200) }; }
+          await sleep(2500);
+          jobOnScreen = liveText(s).replace(/\s+/g, ' ').includes(job);
+        }
+        const wrap = dumpRawAndWrap(s, id);
+        const alive = !s.exit;
+        const kids = alive ? descendants(s.t.pid) : [];
+        if (alive) treeKill.killPaneTreesSync([s.t]);
+        await waitFor(() => s.exit, 10000);
+        await sleep(1500);
+        const left = stillAlive(kids); reap(left);
+        report(id, gate.state === 'idle', {
+          expect: 'the app\'s delivery gate reads the waiting Claude pane as idle',
+          cols, arm, box_ms: boxMs, alive, first_idle_ms: firstIdleMs, final: gate, seen: [...seen], steps,
+          deliver, enter_swallowed: swallowed, job_on_screen: jobOnScreen, wrap, overlay: ARGS.overlay ? ARGS.overlayFiles : null,
+          leftover: left.map((p) => p.name),
+        });
+      }
+    }
+  }
+}
+
 // ---------- agyping ----------
 // Antigravity "signed in -> connected" check, run by the app's own engineAuthGate with a FAKE
 // agy binary: a .cmd shim (like an npm-installed CLI) that prints a canned answer to `-p` and
@@ -906,7 +1013,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude], ['agyping', scenarioAgyPing]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude], ['cldeliver', scenarioClDeliver], ['agyping', scenarioAgyPing]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
