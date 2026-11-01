@@ -597,7 +597,7 @@ async function scenarioOcReader() {
       report(id, !!reads.plain && reads.plain.verdict === 'empty', {
         expect: "reader says 'empty' on an idle input box (needed before the app writes a job)",
         version: versionOf(dir), cols, box_drawn_ms: drawnMs, alive_at_read: alive,
-        ghost, ghost_has_u2026: ghost.includes('…'), reads, wrap, conpty_dll: CONPTY_DLL, overlay: ARGS.overlay ? ARGS.overlayFiles : null, leftover: left.map((p) => p.name),
+        ghost, ghost_has_u2026: ghost.includes('…'), reads, wrap, overlay: ARGS.overlay ? ARGS.overlayFiles : null, leftover: left.map((p) => p.name),
       });
     }
   }
@@ -892,7 +892,7 @@ async function scenarioClDeliver() {
         report(id, gate.state === 'idle', {
           expect: 'the app\'s delivery gate reads the waiting Claude pane as idle',
           cols, arm, box_ms: boxMs, alive, first_idle_ms: firstIdleMs, final: gate, seen: [...seen], steps,
-          deliver, enter_swallowed: swallowed, job_on_screen: jobOnScreen, wrap, overlay: ARGS.overlay ? ARGS.overlayFiles : null,
+          deliver, enter_swallowed: swallowed, job_on_screen: jobOnScreen, wrap, conpty_dll: CONPTY_DLL, overlay: ARGS.overlay ? ARGS.overlayFiles : null,
           leftover: left.map((p) => p.name),
         });
       }
