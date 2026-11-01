@@ -54,6 +54,17 @@ on:
         required: false
         type: string
         default: ''
+      runner:
+        description: 'Hosted Windows image (windows-latest = Server 2025)'
+        required: false
+        type: choice
+        options: [windows-latest, windows-2022, windows-2025]
+        default: windows-latest
+      conpty_dll:
+        description: 'Panes use the conpty.dll bundled with node-pty (new ConPTY) instead of the one in Windows'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -65,7 +76,7 @@ concurrency:
 jobs:
   probe:
     name: install, run engine probe, uninstall
-    runs-on: windows-latest
+    runs-on: ${{ inputs.runner || 'windows-latest' }}
     timeout-minutes: 35
     permissions:
       contents: read
@@ -163,10 +174,13 @@ jobs:
         env:
           PROBE_ONLY: ${{ inputs.only }}
           PROBE_CLD_COLS: ${{ inputs.cld_cols }}
+          PROBE_CONPTY_DLL: ${{ inputs.conpty_dll && '1' || '' }}
         run: |
           if ($env:PROBE_ONLY -cnotmatch '^[a-z,]*$') { Write-Host "::error::bad scenario list"; exit 1 }
           if ($env:PROBE_CLD_COLS -cnotmatch '^[0-9,]*$') { Write-Host "::error::bad width list"; exit 1 }
           if (-not $env:PROBE_CLD_COLS) { Remove-Item Env:PROBE_CLD_COLS -ErrorAction SilentlyContinue }
+          if (-not $env:PROBE_CONPTY_DLL) { Remove-Item Env:PROBE_CONPTY_DLL -ErrorAction SilentlyContinue }
+          "os $([Environment]::OSVersion.VersionString)  conpty_dll=$([bool]$env:PROBE_CONPTY_DLL)"
           $out = Join-Path $PWD 'engine-probe'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $env:ELECTRON_RUN_AS_NODE = '1'

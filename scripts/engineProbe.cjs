@@ -155,11 +155,14 @@ function reap(list) {
   }
 }
 
+const CONPTY_DLL = process.env.PROBE_CONPTY_DLL === '1';
 function spawnPane(file, argv, opts = {}) {
   const t = pty.spawn(file, argv, {
     name: 'xterm-256color', cols: opts.cols || 120, rows: opts.rows || 32,
     cwd: opts.cwd || os.tmpdir(), env: opts.env || process.env,
-    ...(IS_WIN ? { useConpty: true } : {}),
+    // PROBE_CONPTY_DLL=1: the conpty.dll bundled with node-pty (new ConPTY, like Windows 11)
+    // instead of the one in this Windows; an older Windows then draws like a Windows 11 PC.
+    ...(IS_WIN ? { useConpty: true, ...(CONPTY_DLL ? { useConptyDll: true } : {}) } : {}),
   });
   const screen = paneScreen.createPaneScreen({ cols: opts.cols || 120, rows: opts.rows || 32 });
   const rawCap = opts.rawCap || 400000;
@@ -594,7 +597,7 @@ async function scenarioOcReader() {
       report(id, !!reads.plain && reads.plain.verdict === 'empty', {
         expect: "reader says 'empty' on an idle input box (needed before the app writes a job)",
         version: versionOf(dir), cols, box_drawn_ms: drawnMs, alive_at_read: alive,
-        ghost, ghost_has_u2026: ghost.includes('…'), reads, wrap, overlay: ARGS.overlay ? ARGS.overlayFiles : null, leftover: left.map((p) => p.name),
+        ghost, ghost_has_u2026: ghost.includes('…'), reads, wrap, conpty_dll: CONPTY_DLL, overlay: ARGS.overlay ? ARGS.overlayFiles : null, leftover: left.map((p) => p.name),
       });
     }
   }
