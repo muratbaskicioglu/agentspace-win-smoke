@@ -3,7 +3,8 @@
 // REPO RULE: no app source code here. This script repeats the app's RULE (AS-4656), not its code:
 //   detect  — PATH + PATHEXT lookup, a candidate counts only if fs.statSync(p).isFile() (the app's
 //             binResolve rule); `git --version` must print a version.
-//   winget  — the same lookup for `winget` (an App Execution Alias in WindowsApps — does statSync see it?).
+//   winget  — the same lookup for `winget`; if it misses, the user's WindowsApps alias checked with lstat
+//             (run 41458473318 measured: on windows-2025 the alias exists but statSync says EACCES).
 //   install — winget.exe <fixed argv> (no shell, hidden window, 10 min cap):
 //             install --id Git.Git -e --source winget --scope user --silent --disable-interactivity
 //                     --accept-package-agreements --accept-source-agreements
@@ -12,6 +13,9 @@
 //
 // Arms:
 //   clean   — remove the image's preinstalled Git (its own uninstaller, silent) → detection must say "absent".
+//   nowinget— windows-2022 has no alias for the runner user: the rule must say "no winget" (the app then shows
+//             its repair screen with the official download link). Then App Installer is registered (what every
+//             Win10/11 desktop has) and the arms below run.
 //   main    — the app's exact argv (user scope) → Git present after the PATH refresh, git.exe under the
 //             user profile (no admin rights needed).
 //   card    — measured only if `main` fails: the card's line without --scope user / --silent (machine scope).
@@ -150,11 +154,29 @@ function wingetCode(r) {
   try { const s = fs.statSync(alias); aliasStat = { isFile: s.isFile(), size: s.size }; } catch (e) { aliasStat = { error: e.code }; }
   let aliasLstat = null;
   try { const s = fs.lstatSync(alias); aliasLstat = { isFile: s.isFile(), isSymbolicLink: s.isSymbolicLink() }; } catch (e) { aliasLstat = { error: e.code }; }
-  const winget = resolveBin('winget', env);
-  result.winget = { resolve: winget, alias: { exists: fs.existsSync(alias), stat: aliasStat, lstat: aliasLstat, onPath: getPath(env).toLowerCase().includes('windowsapps') } };
+  /** The app's rule (kurulumGerekenler.wingetYolu): PATH lookup, else the WindowsApps alias via lstat. */
+  const wingetRule = () => {
+    const r = resolveBin('winget', env);
+    if (r.state === 'present') return { path: r.path, via: 'path' };
+    try { fs.lstatSync(alias); return { path: alias, via: 'alias-lstat' }; } catch { return null; }
+  };
+  let winget = wingetRule();
+  result.winget = { pathLookup: resolveBin('winget', env), alias: { exists: fs.existsSync(alias), stat: aliasStat, lstat: aliasLstat, onPath: getPath(env).toLowerCase().includes('windowsapps') }, rule: winget };
   log(`winget ${JSON.stringify(result.winget)}`);
-  check('winget: the app rule (PATH + statSync.isFile) finds winget', winget.state === 'present', JSON.stringify(winget));
-  if (winget.state !== 'present') throw new Error('winget not found by the app rule');
+  if (!winget) {
+    result.arms.nowinget = { rule: null, appResult: { durum: 'hata', adim: 'winget', error: 'git-yok' } };
+    log('nowinget: the rule says no winget → app result {durum:hata, adim:winget, error:git-yok} → repair screen (git-eksik)');
+    const w = await run('where.exe', ['winget'], env);
+    log(`nowinget where.exe: code=${w.code} ${w.out.trim().slice(0, 200)}`);
+    const reg = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      'Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe; (Get-AppxPackage Microsoft.DesktopAppInstaller).Version'], env, 5 * 60 * 1000);
+    log(`parity: register App Installer code=${reg.code} ${reg.out.replace(/\s+/g, ' ').trim().slice(0, 300)}`);
+    for (let i = 0; i < 15 && !winget; i += 1) { await new Promise((r) => setTimeout(r, 2000)); winget = wingetRule(); }
+    result.winget.afterRegister = winget;
+    log(`winget after register ${JSON.stringify(winget)}`);
+  }
+  check('winget: the app rule finds winget', !!winget, JSON.stringify(winget));
+  if (!winget) throw new Error('winget not found by the app rule');
   const wv = await run(winget.path, ['--version'], env);
   log(`winget --version ${wv.out.trim()}`);
 
