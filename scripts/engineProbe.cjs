@@ -1122,6 +1122,139 @@ async function scenarioClHook() {
   }
 }
 
+// ---------- clstop ----------
+// AS-4615: does the app's screen reader still say "running" AFTER a real Claude turn ends?
+// A real turn needs a model; the free runner has no key. So Claude talks to a LOCAL fake
+// Messages API (ANTHROPIC_BASE_URL → 127.0.0.1): it streams a short reply after a delay, so
+// the TUI shows its real spinner ("esc to interrupt"), then ends the turn and the Stop hook
+// fires. Nothing leaves the machine; the key is a made-up one. Saved: event names, times,
+// byte offsets of the raw stream at each event, reader states. No prompt text is saved.
+async function scenarioClStop() {
+  const http = require('node:http');
+  const crypto = require('node:crypto');
+  const xd = appOpt('agentxDeliver.cjs');
+  const widths = (process.env.PROBE_CLS_COLS || '120,60').split(',').map(Number).filter((n) => n >= 20 && n <= 300);
+  const delayMs = Number(process.env.PROBE_CLS_DELAY_MS || 4000);
+  const sse = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const { label, dir } of ARGS.claude) {
+    for (const cols of widths) {
+      const id = `clstop-${label}-c${cols}`;
+      const paneId = `p-clstop-${label}-${cols}`;
+      const token = crypto.randomBytes(16).toString('hex');
+      const events = [];
+      const api = [];
+      let s = null;
+      const at = () => (s ? { raw_off: s.raw.length, bytes: s.bytes, quiet_ms: s.lastDataAt ? Date.now() - s.lastDataAt : null } : {});
+      const bridge = http.createServer((req, res) => {
+        let b = '';
+        req.on('data', (d) => { b += d; if (b.length > 70000) req.destroy(); });
+        req.on('end', () => {
+          let j = null; try { j = JSON.parse(b); } catch { j = null; }
+          events.push({ t: Date.now(), auth: req.headers.authorization === `Bearer ${token}`, event: j && j.event, pane_ok: !!j && j.paneId === paneId, ...at() });
+          res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+        });
+      });
+      const fake = http.createServer((req, res) => {
+        let b = '';
+        req.on('data', (d) => { b += d; if (b.length > 4 << 20) req.destroy(); });
+        req.on('end', () => {
+          const p = String(req.url || '').split('?')[0];
+          let j = null; try { j = JSON.parse(b); } catch { j = null; }
+          api.push({ t: Date.now(), method: req.method, path: p, stream: !!(j && j.stream), model: j && typeof j.model === 'string' ? j.model.replace(/[^a-z0-9.-]/gi, '').slice(0, 40) : null });
+          if (req.method === 'POST' && p === '/v1/messages/count_tokens') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"input_tokens":12}'); return; }
+          if (req.method !== 'POST' || p !== '/v1/messages') { res.writeHead(404, { 'content-type': 'application/json' }); res.end('{"type":"error","error":{"type":"not_found_error","message":"probe"}}'); return; }
+          const model = (j && j.model) || 'claude-probe';
+          const msg = { id: `msg_${crypto.randomBytes(6).toString('hex')}`, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 12, output_tokens: 1 } };
+          if (!(j && j.stream)) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ...msg, content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 2 } }));
+            return;
+          }
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+          res.write(sse('message_start', { type: 'message_start', message: msg }));
+          setTimeout(() => {
+            res.write(sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
+            res.write(sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'PROBE-OK' } }));
+            res.write(sse('content_block_stop', { type: 'content_block_stop', index: 0 }));
+            res.write(sse('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 3 } }));
+            res.end(sse('message_stop', { type: 'message_stop' }));
+          }, delayMs);
+        });
+      });
+      await new Promise((r) => bridge.listen(0, '127.0.0.1', r));
+      await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+      const { home, work } = claudeHome(`cls-${label}-${cols}`, true);
+      const env = envFor(home, dir, { ANTHROPIC_API_KEY: FAKE_ANTHROPIC, ANTHROPIC_BASE_URL: `http://127.0.0.1:${fake.address().port}`, DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' });
+      let plan = null; let planErr = null;
+      withAppHome(home, () => {
+        let sink = null;
+        if (spawnPromptFile) { try { sink = spawnPromptFile.createSink({ engine: 'claude', bin: engineInstall.resolveBinary('claude', env), env, home: appDataDir(home), log: () => {} }); } catch { sink = null; } }
+        try { plan = agentRunner.buildSpawn({ command: 'claude', agentId: `probe-cls-${cols}`, cwd: work, disallowSubagent: true }, env, ARGS.app, sink ? { promptFile: sink } : {}); } catch (e) { planErr = String(e && e.message || e).slice(0, 300); }
+        if (plan && plan.trust && plan.trust.pending) { try { agentRunner.ensureEngineTrusted(plan.key, plan.cwd, plan.env); } catch { /* measured below */ } }
+      });
+      const target = plan ? paneTarget(plan) : null;
+      if (!target) { bridge.close(); fake.close(); report(id, false, { plan_error: planErr }); continue; }
+      const paneEnv = { ...plan.env, AGENTSPACE_PANE_ID: paneId, AGENTSPACE_BRIDGE_PORT: String(bridge.address().port), AGENTSPACE_BRIDGE_TOKEN: token };
+      for (const k of Object.keys(paneEnv)) if (/^AGENT[_]?DESK_(BRIDGE|PANE)/.test(k)) delete paneEnv[k];
+      s = spawnPane(target.file, target.argv, { cwd: work, env: paneEnv, cols, rows: 32, rawCap: 8 << 20 });
+      s.lastDataAt = 0;
+      s.t.onData(() => { s.lastDataAt = Date.now(); });
+      const box = () => /❯|Try "|for shortcuts|bypass permissions/.test(liveText(s));
+      await waitFor(() => s.exit || box(), 45000, 250);
+      const boxMs = box() ? Date.now() - s.startedAt : null;
+      await sleep(5000);
+      const reader = () => {
+        const buffer = composerText(s);
+        let state = null; try { state = xd.paneStateOf({ bytes: s.bytes, buffer }); } catch (e) { state = `error: ${String(e && e.message).slice(0, 80)}`; }
+        let diag = null; try { const d = composer.composerDiag(buffer, { ignoreRunning: true, engine: 'claude' }); diag = { verdict: d.verdict, branch: d.branch }; } catch { diag = null; }
+        let rawScan = null; try { rawScan = composer.composerScan(s.raw); } catch { rawScan = null; }
+        return { state, diag, raw_scan: rawScan, ...at() };
+      };
+      const jobs = [];
+      for (let n = 1; n <= 3 && !s.exit; n++) {
+        const job = `CLSTOP probe job ${n} ${label} ${cols} ${crypto.randomBytes(3).toString('hex')}`;
+        const before = reader();
+        const from = events.length;
+        const writtenAt = Date.now();
+        s.t.write(`\x1b[200~${job}\x1b[201~`);
+        await sleep(700);
+        const enterAt = Date.now();
+        s.t.write('\r');
+        await sleep(Math.min(1500, delayMs / 2));
+        const during = reader();
+        await waitFor(() => events.slice(from).some((e) => e.event === 'stop' && e.pane_ok), 30000, 50);
+        const st = events.slice(from).find((e) => e.event === 'stop' && e.pane_ok) || null;
+        const atStop = reader();
+        await sleep(1500);
+        const after = reader();
+        const rc = events.slice(from).find((e) => e.event === 'user-prompt-submit' && e.pane_ok) || null;
+        jobs.push({
+          n, reader_before: before, reader_during: during, reader_at_stop: atStop, reader_after_1500: after,
+          receipt_ms_after_write: rc ? rc.t - writtenAt : null, stop_ms_after_enter: st ? st.t - enterAt : null,
+          events: events.slice(from).map((e) => ({ dt: e.t - enterAt, event: e.event, pane_ok: e.pane_ok, auth: e.auth, raw_off: e.raw_off, quiet_ms: e.quiet_ms })),
+        });
+        await sleep(1500);
+      }
+      const wrap = dumpRawAndWrap(s, id);
+      const alive = !s.exit;
+      const kids = alive ? descendants(s.t.pid) : [];
+      if (alive) treeKill.killPaneTreesSync([s.t]);
+      await waitFor(() => s.exit, 10000);
+      await sleep(1500);
+      const left = stillAlive(kids); reap(left);
+      bridge.close(); fake.close();
+      fs.writeFileSync(path.join(ARGS.out, `${id}.api.json`), `${JSON.stringify(api.map((a) => ({ ...a, t: a.t - s.startedAt })), null, 1)}\n`);
+      const turned = jobs.length === 3 && jobs.every((j) => j.stop_ms_after_enter != null);
+      const stale = jobs.filter((j) => j.reader_after_1500.state === 'busy').length;
+      report(id, turned, {
+        expect: 'three real turns against a local fake API: each job gets a Stop hook; the reader state 1.5 s after Stop is recorded (busy = stale)',
+        cols, delay_ms: delayMs, box_ms: boxMs, api_calls: api.length, stale_busy_after_stop: stale,
+        jobs, wrap, conpty_dll: CONPTY_DLL, leftover: left.map((p) => p.name),
+      });
+    }
+  }
+}
+
 // ---------- agyping ----------
 // Antigravity "signed in -> connected" check, run by the app's own engineAuthGate with a FAKE
 // agy binary: a .cmd shim (like an npm-installed CLI) that prints a canned answer to `-p` and
@@ -1238,7 +1371,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude], ['cldeliver', scenarioClDeliver], ['clhook', scenarioClHook], ['agyping', scenarioAgyPing]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude], ['cldeliver', scenarioClDeliver], ['clhook', scenarioClHook], ['clstop', scenarioClStop], ['agyping', scenarioAgyPing]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
