@@ -1,0 +1,69 @@
+# Goose CLI on Windows: the vendor PowerShell installer, run the way AgentSpace runs it.
+# See scripts/gooseInstallProbe.cjs for the arms.
+#
+# REPO RULE: no app source code and no unreleased build ever goes into this repo.
+# This workflow downloads only the public Goose installer script and runs a test script.
+#
+# Security notes:
+# - Manual trigger only. No push / pull_request / schedule triggers.
+# - No secrets, no account, no provider key: `goose configure` is never completed;
+#   every arm uses a throwaway user home under RUNNER_TEMP.
+# - Actions are pinned to full commit SHAs. Read-only token.
+# - Standard runners only (free on a public repo).
+name: goose install
+
+run-name: goose install ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: 'Shown in the run name only, so the caller can find its run (not used by any step)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: goose-install
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: probe
+        shell: pwsh
+        run: |
+          node scripts/gooseInstallProbe.cjs --out goose-install
+          exit $LASTEXITCODE
+
+      - name: summary
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          if (Test-Path goose-install/evidence.txt) { Get-Content goose-install/evidence.txt | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY }
+
+      - name: upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: goose-install-${{ matrix.runner }}-${{ github.run_id }}
+          path: goose-install
+          if-no-files-found: warn
+          retention-days: 7
