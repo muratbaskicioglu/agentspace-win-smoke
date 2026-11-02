@@ -52,11 +52,11 @@ function isoEnv(home, extra) {
   return { ...env, USERPROFILE: home, HOME: home, LOCALAPPDATA: local, APPDATA: roaming, TEMP: path.join(local, 'Temp'), TMP: path.join(local, 'Temp'), ...extra };
 }
 
-function runTimed(file, argv, env, cwd, timeoutMs) {
+function runTimed(file, argv, env, cwd, timeoutMs, stdin = 'ignore') {
   return new Promise((resolve) => {
     const t0 = Date.now();
     let out = '';
-    const c = spawn(file, argv, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const c = spawn(file, argv, { env, cwd, stdio: [stdin, 'pipe', 'pipe'], windowsHide: true });
     c.stdout.on('data', (d) => { out = (out + d).slice(-8000); });
     c.stderr.on('data', (d) => { out = (out + d).slice(-8000); });
     c.on('error', (e) => { out += `\nspawn error: ${e.message}`; });
@@ -120,14 +120,20 @@ function browserPids() {
   check('no auth.json after install (app shows "not connected")', !fs.existsSync(path.join(home, '.grok', 'auth.json')));
   log(`.grok entries=${fs.readdirSync(path.join(home, '.grok')).join(',')}`);
 
+  // control: a top-level flag AFTER the subcommand is rejected (why the app must never append
+  // defaultArgs to the login argv)
+  const lc = await run(exe, ['login', '--no-auto-update', '--help'], env);
+  log(`control: \`grok login --no-auto-update\` → ${JSON.stringify(lc.out.trim().split('\n')[0])} err=${lc.err}`);
+
   // unsigned arm (measured only)
   const u = await runTimed(exe, ['-p', 'hi', '--no-auto-update', '--output-format', 'streaming-messages-json'], env, home, 30000);
   fs.writeFileSync(path.join(outDir, 'unsigned-p.txt'), mask(u.out));
   check('unsigned -p says "Not signed in"', /Not signed in/.test(u.out), `exit=${u.code} timedOut=${u.timedOut}`);
 
-  // login arm — the app's «Bağla» argv. Time-boxed, never approved.
+  // login arm — the app's «Bağla» argv EXACTLY (`grok login`, stdio all pipes like the app;
+  // top-level flags such as --no-auto-update are rejected after the subcommand — run 41429704312).
   const before = browserPids();
-  const l = await runTimed(exe, ['login', '--no-auto-update'], env, home, 25000);
+  const l = await runTimed(exe, ['login'], env, home, 25000, 'pipe');
   const after = browserPids();
   const newBrowsers = [...after].filter((p) => !before.has(p)).length;
   fs.writeFileSync(path.join(outDir, 'login.txt'), mask(l.out));
@@ -137,7 +143,7 @@ function browserPids() {
   check('no auth.json after the unapproved login (runner never signed in)', !fs.existsSync(path.join(home, '.grok', 'auth.json')));
 
   // device-code arm (fallback) — time-boxed, never approved.
-  const d = await runTimed(exe, ['login', '--device-code', '--no-auto-update'], env, home, 25000);
+  const d = await runTimed(exe, ['login', '--device-auth'], env, home, 25000, 'pipe');
   fs.writeFileSync(path.join(outDir, 'login-device-code.txt'), mask(d.out));
   log(`device-code exit=${d.code} timedOut=${d.timedOut} output (masked): ${JSON.stringify(mask(d.out).slice(0, 600))}`);
 
