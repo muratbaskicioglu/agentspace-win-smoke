@@ -14,8 +14,12 @@
 //   storm     engine that dies at startup, real exit codes fed to the app's spawn fuse
 //   chars     which characters reach a raw-mode TUI through the pty (no engine involved)
 //   codex     real Codex TUI: empty input box read by the app's reader, then typed text
+//             (written through the app's own pane writer when the build has one), then the same
+//             symbols as Win32-input-mode key records (technique arms w32keys-typed / w32keys-long)
 //   opencode  real OpenCode pane with the app's own argv/env: alive after 25 s? leftovers?
 //   claude    real Claude Code pane built like the app's main process: alive? what did it print?
+//             resume-missing: a resume of a session that is not on disk must end in the app's own
+//             dead-session reading + a live fresh pane (main.js fallback), never on the trust dialog
 //   ocreader  idle OpenCode input box (wide + narrow): what does the app's own reader say?
 //             Also saves the raw pty stream (<id>.raw.vt) and the per-row wrap flags (<id>.wrap.json)
 //             so the same screen can be replayed later through the reader.
@@ -277,6 +281,27 @@ async function scenarioBurst() {
 
 // ---------- chars ----------
 const PROBE_TEXT = 'Görev · ölçüm — durum ⛔ bitti… “tırnak” ‘tek’ → ✓ ışık ÇĞİÖŞÜ 🚀 end';
+// The fixed test string of AS-4437 (Turkish letters, euro, dashes, quotes, one emoji).
+const CARD_TEXT = 'çğıöşü ÇĞİÖŞÜ €—“” 🚀 · — ⛔ … “ ” ‘ ’ → ✓ « » ½ ° ±';
+// A long multi-line job, like a real delegation brief (about 5 KB, symbols on every line).
+const LONG_TEXT = Array.from({ length: 40 }, (_, i) => `${i + 1}. Adım · ${CARD_TEXT} — “${i}” bitti… satır ${i + 1}`).join('\n');
+// Win32 input mode: the KEY_EVENT_RECORD form ConPTY itself asks its terminal for (it prints
+// CSI ?9001h at start): ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _ . Vk 0 + Uc = one key press that
+// carries the character, then its release. TECHNIQUE arm only (the probe's own encoding of the
+// Windows protocol, not app code): measures whether ConPTY + Codex take a symbol sent this way.
+// Letters and astral characters stay as text (they already arrive: AS-4437 run 41209725832).
+const w32key = (code) => `\x1b[0;0;${code};1;0;1_\x1b[0;0;${code};0;0;1_`;
+function w32keys(text) {
+  return [...String(text)].map((ch) => {
+    const c = ch.codePointAt(0);
+    return c >= 0xa0 && c <= 0xffff && !/\p{L}/u.test(ch) ? w32key(c) : ch;
+  }).join('');
+}
+// The app's own writer for an engine pane. Newer builds wrap a pane's pty write on Windows
+// (platform/winConsoleInput.cjs, AS-4437); without the module text goes as it is, like those builds.
+const winInput = appOpt('platform/winConsoleInput.cjs');
+const APP_WRITER = winInput && typeof winInput.encodeForPane === 'function' ? 'app-winConsoleInput' : `raw (${(winInput && winInput.loadError) ? 'module not in this build' : 'no encodeForPane'})`;
+const appWrite = (s, engine) => (d) => s.t.write(APP_WRITER === 'app-winConsoleInput' ? winInput.encodeForPane(d, { engine, platform: process.platform }) : d);
 async function scenarioChars() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asprobe-chars-'));
   const sink = path.join(dir, 'got.txt');
@@ -362,15 +387,16 @@ async function scenarioCodex() {
       tail: idle.rows,
     });
     if (s.exit) continue;
+    const w = appWrite(s, 'codex');
     // Type the probe text the way the app delivers it (no Enter: nothing is sent).
-    s.t.write(paste.pastePayload(PROBE_TEXT));
+    w(paste.pastePayload(PROBE_TEXT));
     await sleep(3000);
     saveScreen(`codex-${label}-typed`, s);
     const typed = composer.composerDiag(composerText(s), { ignoreRunning: true });
     const screen = s.screen.liveLines().slice(-6).join('\n');
     const lost = [...new Set([...PROBE_TEXT].filter((ch) => ch.trim() && !screen.includes(ch)))];
     report(`codex-${label}-typed-text`, typed.verdict === 'text' && lost.length === 0, {
-      verdict: typed.verdict, branch: typed.branch, lost_on_screen: lost,
+      writer: APP_WRITER, verdict: typed.verdict, branch: typed.branch, lost_on_screen: lost,
     });
     // Submit (one Enter, as the app does). The fake key makes the request fail with 401,
     // but Codex writes the user message to its own session file first: that file is
@@ -378,15 +404,25 @@ async function scenarioCodex() {
     const sends = [
       { kind: 'typed', text: `${PROBE_TEXT} mark-p1`, mark: 'mark-p1', typedAlready: true },
       { kind: 'bracketed', text: `Teslim satırı · bir — iki ⛔ üç… dört\n${PROBE_TEXT}\nson satır mark-p2`, mark: 'mark-p2' },
+      // TECHNIQUE arms (probe's own Win32-input-mode encoding after the app's pastePayload).
+      { kind: 'w32keys-typed', text: `${CARD_TEXT} ${PROBE_TEXT} mark-p3`, mark: 'mark-p3', technique: true },
+      { kind: 'w32keys-long', text: `${LONG_TEXT}\nson satır mark-p4`, mark: 'mark-p4', technique: true },
     ];
     for (const send of sends) {
       // Codex treats keys that arrive right before Enter as a paste and turns Enter into a
       // new line; the app waits before its Enter, so the probe does too.
-      if (send.typedAlready) { s.t.write(' mark-p1'); await sleep(1500); }
+      let onScreen = null;
+      if (send.typedAlready) { w(' mark-p1'); await sleep(1500); }
       else {
         await waitFor(() => !/esc to interrupt/.test(s.screen.liveLines().slice(-8).join('\n')), 60000, 500);
-        s.t.write(paste.pastePayload(send.text));
-        await sleep(2000);
+        const payload = paste.pastePayload(send.text);
+        if (send.technique) s.t.write(w32keys(payload)); else w(payload);
+        await sleep(send.kind === 'w32keys-long' ? 6000 : 2000);
+        if (send.kind === 'w32keys-typed') {
+          const scr = s.screen.liveLines().slice(-8).join('\n');
+          // Whatever the box shows: a raw sequence on screen means ConPTY did not parse it.
+          onScreen = { lost: [...new Set([...send.text].filter((ch) => ch.trim() && !scr.includes(ch)))], raw_sequence_on_screen: /\[0;0;\d+;[01];0;1_/.test(scr) };
+        }
       }
       s.t.write('\r');
       await sleep(1500);
@@ -399,10 +435,28 @@ async function scenarioCodex() {
         const body = fs.readFileSync(probe.file, 'utf8').split('\n').filter((l) => l.includes(send.mark)).join('\n');
         if (!body) return { missing_in_session_file: null, note: 'message with this mark not in session file' };
         const want = [...new Set([...send.text].filter((ch) => ch.trim()))];
-        return { missing_in_session_file: want.filter((ch) => !body.includes(ch) && !body.includes(JSON.stringify(ch).slice(1, -1))) };
+        // The whole user message as Codex stored it, compared with what was sent.
+        let stored = null;
+        const walk = (v) => { if (stored) return; if (typeof v === 'string') { if (v.includes(send.mark) && v.length >= send.text.length - 2) stored = v; } else if (v && typeof v === 'object') for (const k of Object.keys(v)) walk(v[k]); };
+        for (const l of body.split('\n')) { try { walk(JSON.parse(l)); } catch { /* not json */ } }
+        const sent = send.text.replace(/\r\n?/g, '\n');
+        const got = stored == null ? null : stored.replace(/\r\n?/g, '\n').trim();
+        let firstDiff = null;
+        if (got != null && got !== sent) {
+          let i = 0; while (i < got.length && got[i] === sent[i]) i++;
+          firstDiff = { at: i, sent: sent.slice(Math.max(0, i - 20), i + 40), got: got.slice(Math.max(0, i - 20), i + 40) };
+        }
+        return {
+          missing_in_session_file: want.filter((ch) => !body.includes(ch) && !body.includes(JSON.stringify(ch).slice(1, -1))),
+          same_text: got == null ? null : got === sent, sent_chars: [...sent].length, stored_chars: got == null ? null : [...got].length, first_diff: firstDiff,
+        };
       })();
-      report(`codex-${label}-delivered-${send.kind}`, probe.checked && probe.found && exact && Array.isArray(exact.missing_in_session_file) && exact.missing_in_session_file.length === 0, {
-        needle, rollout: { checked: probe.checked, found: probe.found, reason: probe.reason, candidates: probe.candidates }, ...(exact || {}),
+      const exactOk = exact && Array.isArray(exact.missing_in_session_file) && exact.missing_in_session_file.length === 0;
+      // Technique arms must also store the text unchanged and leave no raw sequence on screen.
+      const techOk = !send.technique || (exact && exact.same_text === true && (!onScreen || (onScreen.lost.length === 0 && !onScreen.raw_sequence_on_screen)));
+      report(`codex-${label}-delivered-${send.kind}`, probe.checked && probe.found && exactOk && techOk, {
+        writer: send.technique ? 'probe-w32keys (technique)' : APP_WRITER, conpty_dll: CONPTY_DLL,
+        needle, rollout: { checked: probe.checked, found: probe.found, reason: probe.reason, candidates: probe.candidates }, ...(exact || {}), ...(onScreen ? { on_screen: onScreen } : {}),
       });
     }
     saveScreen(`codex-${label}-after-send`, s);
@@ -773,6 +827,11 @@ async function claudeArm(label, dir, arm, opts) {
     trust_written: trustOk, trust_keys_before: trustKeys, trust_keys_after: (() => { try { return Object.keys(JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).projects || {}); } catch { return null; } })(),
     trust_dialog: /trust this folder|Quick safety check|Do you trust/i.test(cleanText(s.raw)),
     alive, exit: alive ? null : s.exit, bytes: s.bytes, box_ms: boxMs, typed,
+    // The app's own reading of this exit (main.js onExit): a resume pane that died young with
+    // the engine's "no such session" line is replaced by a fresh pane with the same identity.
+    dead_session_exit: !alive && typeof agentRunner.isDeadSessionExit === 'function'
+      ? agentRunner.isDeadSessionExit({ buffer: s.raw, exitCode: s.exit && s.exit.code, uptimeMs: s.exit && s.exit.ms })
+      : null,
     text_tail: text.replace(/\s+/g, ' ').trim().slice(-700), leftover: left.map((p) => p.name),
   };
 }
@@ -788,6 +847,21 @@ async function scenarioClaude() {
     for (const [arm, opts] of arms) {
       let r;
       try { r = await claudeArm(label, dir, arm, opts); } catch (e) { r = { error: String(e && e.stack || e).slice(0, 1200) }; }
+      if (arm === 'resume-missing') {
+        // AS-4437: Claude Code exits 1 with "No conversation found" for a session that is not on
+        // disk; that is the engine's answer, not a crash. The app's contract is the next step:
+        // main.js recognises the exit (agentRunner.isDeadSessionExit) and spawns the same identity
+        // FRESH ({...resumeOpts, resume:false, sessionId:undefined}). The arm measures both steps.
+        // (Until 15.10 the arm passed only because the pane sat on the trust dialog and never
+        // looked the session up: text_tail of run 38740262409 is "Quick safety check".)
+        let fresh = null;
+        if (!r.alive && r.dead_session_exit === true) {
+          try { fresh = await claudeArm(label, dir, `${arm}-fresh`, { ...opts, spawn: { ...opts.spawn, resume: false, sessionId: undefined } }); } catch (e) { fresh = { error: String(e && e.stack || e).slice(0, 1200) }; }
+        }
+        r = { ...r, fresh_fallback: fresh && { alive: fresh.alive, exit: fresh.exit, argv: fresh.argv, trust_dialog: fresh.trust_dialog, text_tail: fresh.text_tail, error: fresh.error } };
+        report(`claude-${label}-${arm}`, (!!r.alive && !r.trust_dialog) || (r.dead_session_exit === true && !!fresh && !!fresh.alive && !fresh.trust_dialog), r);
+        continue;
+      }
       // Measured, not judged by the arm: an arm passes when the pane is alive at the end
       // (and typed text reached the box). A death is the finding.
       report(`claude-${label}-${arm}`, !!r.alive && (!r.typed || r.typed.in_box), r);
