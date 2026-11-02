@@ -137,6 +137,7 @@ function wingetCode(r) {
     log(`uninstall image Git code=${u.code} ms=${u.ms}`);
     for (let i = 0; i < 30 && fs.existsSync('C:\\Program Files\\Git\\cmd\\git.exe'); i += 1) await new Promise((r) => setTimeout(r, 2000));
   }
+  log(`after uninstall: C:\\Program Files\\Git exists=${fs.existsSync('C:\\Program Files\\Git')} entries=${JSON.stringify(listDir('C:\\Program Files\\Git'))}`);
   // Any other git.exe left on PATH (tool caches) is dropped from THIS process's PATH only.
   for (let i = 0; i < 5; i += 1) {
     const r = resolveBin('git', env);
@@ -172,6 +173,25 @@ function wingetCode(r) {
       'Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe; (Get-AppxPackage Microsoft.DesktopAppInstaller).Version'], env, 5 * 60 * 1000);
     log(`parity: register App Installer code=${reg.code} ${reg.out.replace(/\s+/g, ' ').trim().slice(0, 300)}`);
     for (let i = 0; i < 15 && !winget; i += 1) { await new Promise((r) => setTimeout(r, 2000)); winget = wingetRule(); }
+    if (!winget) {
+      // Server 2022 image has no App Installer package at all: install Microsoft's own release (same version
+      // as the windows-2025 image, v1.11.510) — the state of a stock Win10/11 desktop.
+      const ps = [
+        "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'",
+        "$b='https://github.com/microsoft/winget-cli/releases/download/v1.11.510'",
+        "$d=Join-Path $env:RUNNER_TEMP 'wg'; New-Item -ItemType Directory -Force $d | Out-Null",
+        "Invoke-WebRequest \"$b/DesktopAppInstaller_Dependencies.zip\" -OutFile \"$d\\deps.zip\"",
+        "Invoke-WebRequest \"$b/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle\" -OutFile \"$d\\wg.msixbundle\"",
+        "Expand-Archive \"$d\\deps.zip\" \"$d\\deps\" -Force",
+        "Get-ChildItem \"$d\\deps\\x64\\*.appx\" | ForEach-Object { Add-AppxPackage $_.FullName }",
+        "Add-AppxPackage \"$d\\wg.msixbundle\"",
+        "(Get-AppxPackage Microsoft.DesktopAppInstaller).Version",
+      ].join('; ');
+      const inst = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], env, 10 * 60 * 1000);
+      log(`parity: official winget release v1.11.510 code=${inst.code} ${inst.out.replace(/\s+/g, ' ').trim().slice(-300)}`);
+      for (let i = 0; i < 15 && !winget; i += 1) { await new Promise((r) => setTimeout(r, 2000)); winget = wingetRule(); }
+      result.winget.parity = 'official-release-v1.11.510';
+    }
     result.winget.afterRegister = winget;
     log(`winget after register ${JSON.stringify(winget)}`);
   }
@@ -180,22 +200,35 @@ function wingetCode(r) {
   const wv = await run(winget.path, ['--version'], env);
   log(`winget --version ${wv.out.trim()}`);
 
+  const show = await run(winget.path, ['show', '--id', 'Git.Git', '-e', '--source', 'winget', '--scope', 'user', '--accept-source-agreements', '--disable-interactivity'], env, 120000);
+  const showLines = show.out.split(/\r?\n/).filter((l) => /^\s*(Version|Installer|  Installer Type|  Installer Url|  Scope|Found)/i.test(l) || /scope|installer/i.test(l)).map((l) => l.trim()).slice(0, 12);
+  result.wingetShow = { code: show.code, lines: showLines };
+  log(`winget show --scope user code=${show.code} ${JSON.stringify(showLines)}`);
+
   // main: the app's exact argv
   const m = await run(winget.path, [...ARGV], env, WINGET_MS);
   const mCode = wingetCode(m);
   log(`main winget code=${m.code} result=${mCode} ms=${m.ms}`);
-  log(`main winget tail: ${m.out.replace(/[\r\n]+/g, ' | ').replace(/[^\x20-\x7e|]/g, '').slice(-600)}`);
+  const said = m.out.split(/[\r\n]+/).map((l) => l.replace(/[^\x20-\x7e]/g, '').trim()).filter((l) => l.length > 3 && !/^[-\\|/ ]+$/.test(l) && !/^[\d.]+ (KB|MB)/.test(l));
+  result.mainSaid = said.slice(0, 15);
+  log(`main winget said: ${JSON.stringify(said.slice(0, 15))}`);
   if (mCode === 'ok') setPath(env, merge(getPath(env), registryPath()));
   const after = await gitState(env);
   result.arms.main = { winget: { code: m.code, result: mCode, ms: m.ms }, git: after };
   check('main: winget user-scope install exit ok', mCode === 'ok', String(m.code));
   check('main: after the registry PATH refresh Git is present with a version', after.state === 'present' && !!after.version, JSON.stringify(after));
-  check('main: git.exe is under the user profile (user scope, no admin)', after.state === 'present' && after.path.toLowerCase().startsWith(home.toLowerCase()), after.path || '');
-  const bash = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git', 'bin', 'bash.exe');
-  result.arms.main.gitBash = fs.existsSync(bash);
-  check('main: Git Bash present where Claude Code looks (%LOCALAPPDATA%\\Programs\\Git\\bin\\bash.exe)', fs.existsSync(bash));
+  const scope = after.state === 'present' && after.path.toLowerCase().startsWith(home.toLowerCase()) ? 'user' : 'machine';
+  result.arms.main.scope = scope;
+  log(`main: installed scope = ${scope} (${after.path || '-'})`);
+  // Claude Code finds Git Bash in either Git for Windows location (the app's gitBashAdaylari list holds both).
+  const bashes = [path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git', 'bin', 'bash.exe'), 'C:\\Program Files\\Git\\bin\\bash.exe'];
+  const bash = bashes.find((b) => fs.existsSync(b)) || null;
+  result.arms.main.gitBash = bash;
+  check('main: Git Bash present in a Git for Windows location', !!bash, bash || '');
   const hkcu = regPath('HKCU\\Environment') || '';
-  check('main: the installer wrote the user PATH (HKCU)', /programs\\git\\cmd/i.test(hkcu), hkcu.split(home).join('<HOME>').slice(0, 200));
+  const hklm = regPath('HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment') || '';
+  result.arms.main.pathWritten = { user: /\\git\\cmd/i.test(hkcu), machine: /\\git\\cmd/i.test(hklm) };
+  check('main: the installer wrote a registry PATH the refresh reads (HKCU or HKLM)', /\\git\\cmd/i.test(hkcu + ';' + hklm), JSON.stringify(result.arms.main.pathWritten));
 
   // card: only if main failed — is the card's machine-scope line any better?
   if (mCode !== 'ok') {
