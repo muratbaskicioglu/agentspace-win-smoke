@@ -75,10 +75,11 @@ function resolveBin(name, env) {
 
 const run = (file, argv, env, timeout = 20000) => new Promise((resolve) => {
   const t0 = Date.now();
-  execFile(file, argv, { env, windowsHide: true, timeout, maxBuffer: 16 << 20 }, (err, so, se) => resolve({
+  // Like the app: execFile inside a Promise executor. A synchronous spawn throw is recorded, not fatal.
+  try { execFile(file, argv, { env, windowsHide: true, timeout, maxBuffer: 16 << 20 }, (err, so, se) => resolve({
     code: err ? (typeof err.code === 'number' ? err.code : (err.killed ? null : err.code)) : 0,
     killed: !!(err && err.killed), ms: Date.now() - t0, out: `${so || ''}${se || ''}`,
-  }));
+  })); } catch (e) { resolve({ code: null, spawnError: String(e && e.message), killed: false, ms: Date.now() - t0, out: '' }); }
 });
 
 async function gitState(env) {
@@ -197,8 +198,20 @@ function wingetCode(r) {
   }
   check('winget: the app rule finds winget', !!winget, JSON.stringify(winget));
   if (!winget) throw new Error('winget not found by the app rule');
-  const wv = await run(winget.path, ['--version'], env);
-  log(`winget --version ${wv.out.trim()}`);
+  let wv = await run(winget.path, ['--version'], env);
+  if (wv.spawnError) {
+    // The app runs execFile inside a Promise executor: this throw rejects deps.run, calis() catches it and
+    // the state becomes {durum:hata, error:git-yok} → repair screen (unit test: "spawn atarsa").
+    result.arms.aliasSpawn = { error: wv.spawnError, app: { durum: 'hata', error: 'git-yok' } };
+    log(`alias spawn failed: ${wv.spawnError} → app result {durum:hata, error:git-yok} → repair screen`);
+    const loc = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '(Get-AppxPackage Microsoft.DesktopAppInstaller).InstallLocation'], env, 60000);
+    const real = path.win32.join(loc.out.trim(), 'winget.exe');
+    log(`probe-only: package path ${fs.existsSync(real) ? 'exists' : 'missing'} (not the app path)`);
+    winget = { path: real, via: 'package-path-probe-only' };
+    wv = await run(winget.path, ['--version'], env);
+    if (wv.spawnError) { log(`package path spawn failed too: ${wv.spawnError}`); throw new Error('winget cannot start on this image'); }
+  }
+  log(`winget --version ${wv.out.trim()} via=${winget.via}`);
 
   const show = await run(winget.path, ['show', '--id', 'Git.Git', '-e', '--source', 'winget', '--scope', 'user', '--accept-source-agreements', '--disable-interactivity'], env, 120000);
   const showLines = show.out.split(/\r?\n/).filter((l) => /^\s*(Version|Installer|  Installer Type|  Installer Url|  Scope|Found)/i.test(l) || /scope|installer/i.test(l)).map((l) => l.trim()).slice(0, 12);
