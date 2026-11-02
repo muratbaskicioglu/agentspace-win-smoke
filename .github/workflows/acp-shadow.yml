@@ -1,0 +1,136 @@
+# REPO RULE: no app source code and no unreleased build ever goes into this repo.
+# Only published packages from npm / the official Claude installer + test scripts.
+#
+# ACP shadow RECORDER (ACP phase 1): ten scripted scenarios are driven through BOTH paths
+# against a LOCAL FAKE model server, and the raw events are recorded with timestamps:
+#   screen = the official Claude Code CLI in a pseudo terminal (node-pty from npm), keys typed
+#   acp    = @agentclientprotocol/claude-agent-acp driving the same official CLI over JSON-RPC
+# No decisions are made here. The recordings are downloaded and decided elsewhere.
+#
+# Security notes (same rules as the other workflows here):
+# - Manual trigger only. No push / pull_request / schedule triggers.
+# - No secrets. Throwaway HOME per run, FAKE API key, model calls go to 127.0.0.1 only.
+# - Inputs reach the shell only through env vars and are checked against strict patterns.
+# - Actions are pinned to full commit SHAs. Recordings hold only synthetic scenario text,
+#   masked temp paths and milliseconds.
+name: acp shadow
+
+run-name: acp shadow ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      claude_acp:
+        description: '@agentclientprotocol/claude-agent-acp version'
+        required: false
+        type: string
+        default: '0.99.1'
+      claude_cli:
+        description: 'Official Claude Code CLI version (native installer)'
+        required: false
+        type: string
+        default: '2.1.316'
+      node_pty:
+        description: 'node-pty version (prebuilt binaries from npm)'
+        required: false
+        type: string
+        default: '1.1.0'
+      request_id:
+        description: 'Shown in the run name only'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acp-shadow
+  cancel-in-progress: false
+
+jobs:
+  record:
+    name: acp shadow ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      V_CLAUDE_ACP: ${{ inputs.claude_acp }}
+      V_CLAUDE_CLI: ${{ inputs.claude_cli }}
+      V_NODE_PTY: ${{ inputs.node_pty }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: check inputs
+        run: |
+          for v in "$V_CLAUDE_ACP" "$V_CLAUDE_CLI" "$V_NODE_PTY"; do
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version $v"; exit 1; }
+          done
+          node --version; npm --version; uname -a
+
+      - name: install adapter and node-pty from npm (pinned)
+        run: |
+          set -e
+          root="$(cygpath -m "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/shadow"; mkdir -p "$root"
+          npm install --no-audit --no-fund --prefix "$root/claude" "@agentclientprotocol/claude-agent-acp@$V_CLAUDE_ACP" 2>&1 | tail -2
+          npm install --no-audit --no-fund --ignore-scripts --prefix "$root/pty" "node-pty@$V_NODE_PTY" 2>&1 | tail -2
+          npm ls --prefix "$root/claude" --depth=0 | tail -n +2
+          npm ls --prefix "$root/pty" --depth=0 | tail -n +2
+          echo "SHADOW_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: install official Claude Code CLI (Windows, native installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ([scriptblock]::Create((Invoke-RestMethod -UseBasicParsing https://claude.ai/install.ps1))) $env:V_CLAUDE_CLI | Out-Host
+          $exe = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+          if (-not (Test-Path $exe)) { throw "claude.exe not installed" }
+          & $exe --version | Out-Host
+          "CLAUDE_EXE=$exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: install official Claude Code CLI (macOS, native installer)
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          curl -fsSL https://claude.ai/install.sh | bash -s "$V_CLAUDE_CLI"
+          exe="$(cd ~/.local/bin && pwd)/claude"
+          "$exe" --version
+          echo "CLAUDE_EXE=$exe" >> "$GITHUB_ENV"
+
+      - name: record 10 scenarios x 2 paths (fake model)
+        run: |
+          out="$GITHUB_WORKSPACE/acp-shadow-${{ matrix.os }}"
+          node scripts/acp/shadow/record.cjs --out "$out" --claude-exe "$CLAUDE_EXE" \
+            --adapter-prefix "$SHADOW_ROOT/claude" --pty "$SHADOW_ROOT/pty/node_modules/node-pty" || echo "::warning::recorder exit $?"
+          cat "$out/record-summary.json"
+
+      - name: no leftover engine processes
+        if: ${{ !cancelled() }}
+        run: |
+          sleep 10
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -NoProfile -Command '$l = Get-CimInstance Win32_Process | Where-Object { $_.Name -match "^claude(\.exe)?$" -or ($_.Name -eq "node.exe" -and $_.CommandLine -match "acp|hookRec") }; $l | Select-Object ProcessId, Name | Format-Table | Out-Host; "leftover_count $(@($l).Count)"'
+          else
+            ps -axo pid,comm | grep -E "claude|hookRec" | grep -v grep || true
+          fi
+
+      - name: upload recordings (jsonl, json)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acp-shadow-${{ matrix.os }}-${{ github.run_id }}
+          path: acp-shadow-${{ matrix.os }}
+          if-no-files-found: warn
+          retention-days: 7

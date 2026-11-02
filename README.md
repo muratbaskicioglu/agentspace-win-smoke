@@ -22,6 +22,7 @@ throwaway GitHub-hosted runner.
 | `engines.yml` | windows-latest | engine panes (Codex, OpenCode, Claude Code) with the installed app's own modules |
 | `seal.yml` | macos-15, macos-26, windows-2025 | bundle seal: does the running app write into its own bundle / install folder? macOS: codesign + spctl + file list before and after walking every page in the app window, relaunch, launch with the quarantine flag; Windows: a read-only (Program Files style) copy must run without write errors. `expect=broken` is the control for a release known to have the problem |
 | `close-console.yml` | windows-2022, windows-2025, windows-11-arm | close console: does a visible console window open when the app closes? Window list every 25 ms + process creation audit (4688) during a real close (WM_CLOSE), then the app's own spawn code in Node mode with the shipped options (control) and with the fix's options. Captures are of the new console window only |
+| `acp-shadow.yml` | windows-2025, windows-2022, macos-15 | ACP shadow recorder: ten scripted scenarios through the official Claude Code CLI in a pseudo terminal AND through the published ACP adapter, against a local fake model (no key, no network model calls). Records only event names and milliseconds; the decisions are made elsewhere |
 
 ```
 gh workflow run clean-profile.yml -R muratbaskicioglu/agentspace-win-smoke \
