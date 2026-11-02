@@ -19,6 +19,8 @@
 # - Actions are pinned to full commit SHAs.
 name: windows engine probe
 
+run-name: windows engine probe ${{ inputs.runner || 'windows-latest' }} ${{ inputs.request_id }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -65,6 +67,11 @@ on:
         required: false
         type: boolean
         default: false
+      request_id:
+        description: 'Shown in the run name only, so a caller (the app repo motor gate) can find its run (not used by any step)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read

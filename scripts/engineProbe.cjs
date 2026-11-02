@@ -30,11 +30,14 @@
 //             does the app's own delivery gate read it idle, and does the app's writer put a job in?
 //   clhook    idle Claude Code pane built by the app, with its hooks posting to a local bridge: does
 //             each hook event carry the pane id, and does the prompt receipt arrive within 10 s of Enter?
-//   agyping   Antigravity sign-in check with a FAKE agy binary (no account, nothing reaches Google):
+//   agyping   Antigravity sign-in check with a STRICT FAKE agy binary (scripts/fakeAgy.cjs: only the
+//             real agy 1.4.12 flags; no account, nothing reaches Google):
 //             the app's own engineAuthGate runs its one-shot check, then the app's own status row
 //             (decorateStatus) is read. Measured: exactly one check per click, the reason class,
 //             the engine's own line with the home folder / e-mail / token masked (made-up names
 //             only), the same row for settings and setup, and "signed in" -> "connected" on success.
+//             Every arm is red when the app's check sends a flag the real agy rejects (flag_errors).
+//             agyping-strict: control arm, the fake rejects `-o text` and accepts `--output-format text`.
 //
 // --overlay <dir> --overlay-files a.cjs,b.cjs: load those app modules from <dir> instead of the
 // app (used by a private test run to compare a fix with the shipped code; never used here).
@@ -1278,34 +1281,15 @@ const AGY_ARMS = {
   // The OS builds the line: Node's own ENOENT message for the credentials file under the home.
   D4: { user: 'Ayşe Örnekoğlu', home: true, lines: 'os-error', forbid: ['Ayşe', 'Örnekoğlu'] },
 };
+// The fake is STRICT (scripts/fakeAgy.cjs): only the real agy 1.4.12 flags pass; any other flag
+// gets the real "flags provided but not defined: -X" line and exit 2, so a release whose check
+// sends a flag the real agy does not know goes red here, as it would on every customer machine.
+const FAKE_AGY = require('./fakeAgy.cjs');
 function fakeAgy(dir) {
-  const js = path.join(dir, 'fake-agy.js');
-  fs.writeFileSync(js, `'use strict';
-const fs = require('fs'); const os = require('os'); const path = require('path');
-const a = process.argv.slice(2);
-try { fs.appendFileSync(process.env.AGY_FAKE_CALLS, JSON.stringify({ at: Date.now(), argv0: a[0] || '' }) + '\\n'); } catch {}
-if (a[0] === '--version' || a[0] === '-v') { process.stdout.write('1.1.28\\n'); process.exit(0); }
-if (a[0] === 'models') { process.stdout.write('gemini-3-pro\\n'); process.exit(0); }
-if (a[0] !== '-p') { process.stderr.write('fake agy: interactive start not supported\\n'); process.exit(2); }
-const mode = process.env.AGY_FAKE_MODE;
-if (mode === 'ok') { process.stdout.write('OK\\n'); process.exit(0); }
-if (mode === 'os-error') {
-  try { fs.readFileSync(path.join(os.homedir(), '.gemini', 'antigravity-cli', 'oauth.json')); }
-  catch (e) { process.stderr.write('Error: not logged in: ' + e.message + '\\n'); }
-  process.exit(1);
+  return FAKE_AGY.writeFakeAgy(dir, process.env.PROBE_NODE || 'node', IS_WIN);
 }
-for (const l of JSON.parse(process.env.AGY_FAKE_LINES || '[]')) process.stderr.write(l + '\\n');
-process.exit(1);
-`);
-  const node = process.env.PROBE_NODE || 'node';
-  if (IS_WIN) {
-    const cmd = path.join(dir, 'agy.cmd');
-    fs.writeFileSync(cmd, `@echo off\r\n"${node}" "%~dp0fake-agy.js" %*\r\n`);
-    return cmd;
-  }
-  const sh = path.join(dir, 'agy');
-  fs.writeFileSync(sh, `#!/bin/sh\nexec "${node}" "$(dirname "$0")/fake-agy.js" "$@"\n`, { mode: 0o755 });
-  return sh;
+function readAgyCalls(file) {
+  try { return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
 }
 async function scenarioAgyPing() {
   const gate = appOpt('engineAuthGate.cjs');
@@ -1315,6 +1299,12 @@ async function scenarioAgyPing() {
   }
   const binDir = isoHome('agy-bin');
   const bin = fakeAgy(binDir);
+  // Control: the fake itself rejects the broken argv and accepts the real form. If this is red,
+  // the fake (not the app) is wrong and the arms below prove nothing.
+  {
+    const st = FAKE_AGY.selfTest(bin, { ...process.env, AGY_FAKE_CALLS: path.join(binDir, 'selftest.jsonl') });
+    report('agyping-strict', st.pass, { expect: 'strict fake: `-o text` -> exit 2 "flags provided but not defined: -o"; `--output-format text` -> OK; bad value -> exit 2; --version -> 1.4.12', fake_version: FAKE_AGY.AGY_VERSION, arms: st.arms });
+  }
   for (const [arm, spec] of Object.entries(AGY_ARMS)) {
     const id = `agyping-${arm}`;
     const box = isoHome(`agy-${arm}`);
@@ -1342,25 +1332,29 @@ async function scenarioAgyPing() {
       await sleep(3000); // idle: no new check may start by itself
       after2 = gate.decorateStatus(row, deps);
     } catch (e) { err = String(e && e.stack || e).slice(0, 1200); }
-    const nCalls = (() => { try { return fs.readFileSync(calls, 'utf8').split('\n').filter(Boolean).filter((l) => JSON.parse(l).argv0 === '-p').length; } catch { return 0; } })();
+    const callRecs = readAgyCalls(calls).filter((c) => c.argv0 === '-p');
+    const nCalls = callRecs.length;
+    // What the app sent: flag names only (no prompt text) and the fake's flag error, if any.
+    const sent = callRecs.map((c) => ({ flags: c.flags || null, flag_error: c.err || null }));
+    const flagErrors = sent.filter((c) => c.flag_error).map((c) => c.flag_error);
     const pick = (o) => (o ? { kurulumDurumu: o.kurulumDurumu, verified: o.verified, verifyUntried: o.verifyUntried, verifyError: o.verifyError, verifyReason: o.verifyReason, verifyDetail: o.verifyDetail } : null);
     const shown = (after && after.verifyDetail) || '';
     const leaked = (spec.forbid || []).filter((w) => shown.includes(w) || (res && String(res.satir || '').includes(w)));
     let pass; let expect;
     if (arm === 'ok') {
       expect = "before 'girisli' (untried), one check, then 'bagli' with no error";
-      pass = !err && before && before.kurulumDurumu === 'girisli' && before.verifyUntried === true
+      pass = !err && flagErrors.length === 0 && before && before.kurulumDurumu === 'girisli' && before.verifyUntried === true
         && res && res.verified === true && after && after.kurulumDurumu === 'bagli' && after.verified === true && !after.verifyError && nCalls === 1;
     } else {
       expect = "one check; reason 'ret'; engine line shown with the home folder -> ~ (arms with a path) and e-mail/token masked; settings row == setup row; no new check when idle";
-      pass = !err && res && res.verified === false && res.neden === 'ret' && nCalls === 1
+      pass = !err && flagErrors.length === 0 && res && res.verified === false && res.neden === 'ret' && nCalls === 1
         && after && after.verified === false && after.verifyReason === res.neden && after.verifyDetail === res.satir && after.verifyError === res.error
         && !!res.satir && leaked.length === 0 && (!spec.home || /~/.test(res.satir)) && !/\u001b/.test(res.satir)
         && JSON.stringify(pick(after)) === JSON.stringify(pick(after2));
     }
     report(id, !!pass, {
       expect, user_dir: arm === 'ok' ? null : (spec.user.includes(' ') ? 'spaced, non-ASCII' : 'plain'),
-      checks_run: nCalls, result: res ? { verified: res.verified, error: res.error, neden: res.neden, satir: res.satir } : null,
+      checks_run: nCalls, sent, flag_errors: flagErrors, result: res ? { verified: res.verified, error: res.error, neden: res.neden, satir: res.satir } : null,
       before: pick(before), after: pick(after), after_idle: pick(after2), leaked, error: err,
     });
   }

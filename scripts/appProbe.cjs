@@ -13,6 +13,11 @@
 //   memory    The app's own memory brake (resourceGovernor): a real sample on this
 //             machine, the level it gives with the default thresholds, the agent and
 //             pane limits it derives, and a raised threshold, to show the brake trips.
+//   agy-signin  (opt-in: --check agy-signin) A pre-signed-in Antigravity: the app's own
+//             engineAuthGate runs its one-shot check against a STRICT fake agy
+//             (scripts/fakeAgy.cjs: only the real agy 1.4.12 flags; no account, no network).
+//             Pass = 'girisli' before, exactly one check, no flag rejected, 'bagli' after.
+//             A build whose check sends a flag the real agy rejects (v0.4.9: `-o`) fails here.
 //
 // Usage:
 //   ELECTRON_RUN_AS_NODE=1 <AgentSpace binary> scripts/appProbe.cjs \
@@ -40,7 +45,7 @@ const ARGS = (() => {
 })();
 if (!ARGS.app) { console.error('--app required'); process.exit(2); }
 for (const c of ARGS.check) {
-  if (!['agy-hook', 'memory'].includes(c)) { console.error(`unknown check ${c}`); process.exit(2); }
+  if (!['agy-hook', 'memory', 'agy-signin'].includes(c)) { console.error(`unknown check ${c}`); process.exit(2); }
 }
 fs.mkdirSync(ARGS.out, { recursive: true });
 
@@ -196,11 +201,56 @@ function checkMemory() {
   };
 }
 
+async function checkAgySignin() {
+  const gate = app('engineAuthGate.cjs');
+  if (typeof gate.verifyEngine !== 'function' || typeof gate.decorateStatus !== 'function') {
+    return { verdict: 'unmeasured', reason: 'engineAuthGate.verifyEngine/decorateStatus not exported by this build' };
+  }
+  const FAKE = require('./fakeAgy.cjs');
+  const node = process.env.PROBE_NODE || 'node';
+  const bin = FAKE.writeFakeAgy(path.join(BASE, 'agy-bin'), node);
+  // Control: the fake itself must reject the broken form and accept the real one.
+  const self = FAKE.selfTest(bin, { ...process.env, AGY_FAKE_CALLS: path.join(BASE, 'agy-selftest.jsonl') });
+  if (!self.pass) return { verdict: 'unmeasured', reason: 'strict fake agy self-test failed (no usable node?)', selfTest: self.arms };
+  const calls = path.join(BASE, 'agy-calls.jsonl');
+  const env = {
+    ...paneEnv(), HOME, USERPROFILE: HOME,
+    AGENTSPACE_FAKE_ENGINE_BIN: '1', AGENTSPACE_ENGINE_BIN_ANTIGRAVITY: bin,
+    AGY_FAKE_CALLS: calls, AGY_FAKE_MODE: 'ok',
+  };
+  // The status row the app reads for a signed-in agy before its first check.
+  const row = { engine: 'antigravity', installed: true, loggedIn: true, flow: 'external' };
+  const deps = { env, statusRow: row, cwd: HOME, probeTimeoutMs: 60000, platform: process.platform };
+  if (typeof gate.forgetVerification === 'function') gate.forgetVerification('antigravity');
+  const before = gate.decorateStatus(row, deps);
+  const res = await gate.verifyEngine('antigravity', deps);
+  const after = gate.decorateStatus(row, deps);
+  let recs = [];
+  try { recs = fs.readFileSync(calls, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((c) => c.argv0 === '-p'); } catch { /* none */ }
+  const flagErrors = recs.map((c) => c.err).filter(Boolean);
+  const pass = flagErrors.length === 0 && recs.length === 1
+    && before && before.kurulumDurumu === 'girisli'
+    && res && res.verified === true
+    && after && after.kurulumDurumu === 'bagli' && after.verified === true && !after.verifyError;
+  return {
+    verdict: pass ? 'pass' : 'fail',
+    fakeVersion: FAKE.AGY_VERSION,
+    selfTest: self.arms.map((a) => ({ argv: a.argv, code: a.code, first: a.first })),
+    checksRun: recs.length,
+    sent: recs.map((c) => ({ flags: c.flags, flagError: c.err || null })),
+    flagErrors,
+    result: res ? { verified: res.verified, error: res.error || null, neden: res.neden || null, satir: scrub(tail(res.satir, 200)) } : null,
+    before: before ? before.kurulumDurumu : null,
+    after: after ? after.kurulumDurumu : null,
+  };
+}
+
+(async () => {
 let exit = 0;
 for (const c of ARGS.check) {
   let r;
   try {
-    r = c === 'agy-hook' ? checkAgyHook() : checkMemory();
+    r = c === 'agy-hook' ? checkAgyHook() : c === 'agy-signin' ? await checkAgySignin() : checkMemory();
   } catch (err) {
     r = { verdict: 'unmeasured', reason: scrub(tail(err && err.stack, 800)) };
   }
@@ -212,10 +262,13 @@ result.exit = exit;
 const name = `app-probe${ARGS.label ? `-${ARGS.label}` : ''}.json`;
 fs.writeFileSync(path.join(ARGS.out, name), JSON.stringify(result, null, 2));
 for (const [c, r] of Object.entries(result.checks)) {
-  const extra = c === 'agy-hook'
+  const extra = c === 'agy-signin'
+    ? ` before=${r.before} after=${r.after} checks=${r.checksRun ?? '-'} flagErrors=${JSON.stringify(r.flagErrors || [])} result=${JSON.stringify(r.result || null)}${r.reason ? ` reason=${r.reason}` : ''}`
+    : c === 'agy-hook'
     ? ` hooks=${r.hookCount ?? '-'} failed=${r.failedCount ?? '-'}${r.runs ? ` first=${JSON.stringify((r.runs.find((x) => !x.ok) || r.runs[0]).stderr || '')}` : ''}${r.reason ? ` reason=${r.reason}` : ''}`
     : ` total=${r.totalGB}GB free=${r.freePct}% os=${r.osPressure} level=${r.level} agentLimit=${r.agentLimit} paneCap=${r.paneCap} raised(${r.raisedThreshold && r.raisedThreshold.warnFreePct}%)=${r.raisedThreshold && r.raisedThreshold.level}${r.reason ? ` reason=${r.reason}` : ''}`;
   console.log(`app-probe ${c}: ${r.verdict}${extra}`);
 }
 try { fs.rmSync(BASE, { recursive: true, force: true }); } catch { /* best effort */ }
 process.exit(exit);
+})();

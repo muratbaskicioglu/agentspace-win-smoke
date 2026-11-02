@@ -5,7 +5,8 @@
 # the release file from agentspace-releases, checks its sha256, then:
 #   install -> first launch up to the sign-in screen -> close -> uninstall
 # with a frame of every window step. It also runs two checks with the installed app's own
-# modules (scripts/appProbe.cjs): the Antigravity hook command and the memory brake.
+# modules (scripts/appProbe.cjs): the Antigravity hook command and the memory brake, and on Windows
+# a pre-signed-in Antigravity checked against a strict fake agy (agy-signin).
 #
 # The release script in the app repo dispatches this workflow before a release becomes
 # "Latest" (scripts/release/clean_profile_gate.cjs). An empty mac_x64_sha256 / win_sha256
@@ -181,6 +182,30 @@ jobs:
           Get-Content (Join-Path $out 'app-probe-stderr.txt') -ErrorAction SilentlyContinue | Select-Object -Last 20
           Get-Content (Join-Path $out 'app-probe-stdout.txt') | ForEach-Object { "- $_" } | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           "app probe exit $($p.ExitCode)"
+          exit $p.ExitCode
+
+      # Sign-in arm (MOTOR-GUVEN-KABUL): a pre-signed-in Antigravity checked by the app's own
+      # engineAuthGate against a STRICT fake agy (only the real agy 1.4.12 flags). No account,
+      # no network. A build whose check sends a flag the real agy rejects goes red here.
+      - name: pre-signed-in Antigravity (app's own check, strict fake agy)
+        if: ${{ !cancelled() }}
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\agentdesk-shell\AgentSpace.exe'
+          if (-not (Test-Path $exe)) {
+            $exe = (Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Depth 2 -Filter 'AgentSpace.exe' -File | Select-Object -First 1).FullName
+          }
+          if (-not $exe) { Write-Host "::error::installed AgentSpace.exe not found"; exit 2 }
+          $asar = Join-Path (Split-Path $exe) 'resources\app.asar'
+          $out = Join-Path $PWD 'clean-profile-win'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          $env:PROBE_NODE = (Get-Command node).Source
+          $p = Start-Process -FilePath $exe -ArgumentList @('scripts/appProbe.cjs', '--app', "`"$asar`"", '--out', "`"$out`"", '--check', 'agy-signin', '--label', 'win-agy') `
+            -NoNewWindow -PassThru -Wait -RedirectStandardOutput (Join-Path $out 'app-probe-agy-stdout.txt') -RedirectStandardError (Join-Path $out 'app-probe-agy-stderr.txt')
+          Get-Content (Join-Path $out 'app-probe-agy-stdout.txt')
+          Get-Content (Join-Path $out 'app-probe-agy-stderr.txt') -ErrorAction SilentlyContinue | Select-Object -Last 20
+          Get-Content (Join-Path $out 'app-probe-agy-stdout.txt') | ForEach-Object { "- $_" } | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          "agy sign-in probe exit $($p.ExitCode)"
           exit $p.ExitCode
 
       - name: uninstall
