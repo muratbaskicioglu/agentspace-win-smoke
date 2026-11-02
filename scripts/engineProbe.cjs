@@ -28,6 +28,8 @@
 //             box? Enter is NOT sent (it would reach a model): the Enter key write is swallowed.
 //   cldeliver idle Claude Code pane (fresh / after /model / after a typed line, several widths):
 //             does the app's own delivery gate read it idle, and does the app's writer put a job in?
+//   clhook    idle Claude Code pane built by the app, with its hooks posting to a local bridge: does
+//             each hook event carry the pane id, and does the prompt receipt arrive within 10 s of Enter?
 //   agyping   Antigravity sign-in check with a FAKE agy binary (no account, nothing reaches Google):
 //             the app's own engineAuthGate runs its one-shot check, then the app's own status row
 //             (decorateStatus) is read. Measured: exactly one check per click, the reason class,
@@ -1007,6 +1009,119 @@ async function scenarioClDeliver() {
   }
 }
 
+// ---------- clhook ----------
+// The app's second source of truth for a team-chat job: Claude Code's OWN hooks. The shipped
+// pane is built by the app (agentRunner.buildSpawn adds its `--settings` with the Stop and
+// UserPromptSubmit hooks); the hooks post to a local bridge the way the app's main process
+// receives them (AGENTSPACE_PANE_ID + bridge port/token in the pane env). Here the bridge is a
+// tiny local server in this probe. Measured per width: does each hook event carry THIS pane's
+// id, how long after Enter does the prompt receipt arrive, does its prompt signature contain
+// the job, and what does the app's screen reader say at the same moment (blind or not).
+// Enter IS sent here: the FAKE key is rejected, so nothing reaches a model (same as
+// claude after-reply). Only event names, pane ids, times, lengths and booleans are saved:
+// no prompt text leaves the bridge.
+async function scenarioClHook() {
+  const http = require('node:http');
+  const crypto = require('node:crypto');
+  const xd = appOpt('agentxDeliver.cjs');
+  const widths = (process.env.PROBE_CLD_COLS || '120,60').split(',').map(Number).filter((n) => n >= 20 && n <= 300);
+  const fold = (x) => String(x || '').replace(/\s+/g, ' ').trim();
+  for (const { label, dir } of ARGS.claude) {
+    for (const cols of widths) {
+      const id = `clhook-${label}-c${cols}`;
+      const paneId = `p-clhook-${label}-${cols}`;
+      const token = crypto.randomBytes(16).toString('hex');
+      const events = [];
+      let currentJob = '';
+      const srv = http.createServer((req, res) => {
+        let b = '';
+        req.on('data', (d) => { b += d; if (b.length > 70000) req.destroy(); });
+        req.on('end', () => {
+          let j = null; try { j = JSON.parse(b); } catch { j = null; }
+          const probe = j && typeof j.promptProbe === 'string' ? j.promptProbe : null;
+          events.push({
+            t: Date.now(), auth: req.headers.authorization === `Bearer ${token}`, path: req.url,
+            event: j && j.event, pane_ok: !!j && j.paneId === paneId, has_pane: !!(j && j.paneId),
+            has_agent: !!(j && j.agentId), probe_len: probe == null ? null : probe.length,
+            probe_has_job: probe == null ? null : (!!currentJob && fold(probe).includes(currentJob)),
+          });
+          res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+        });
+      });
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+      const port = srv.address().port;
+      const { home, work } = claudeHome(`clh-${label}-${cols}`, true);
+      const env = envFor(home, dir, { ANTHROPIC_API_KEY: FAKE_ANTHROPIC, DISABLE_AUTOUPDATER: '1' });
+      let plan = null; let planErr = null;
+      withAppHome(home, () => {
+        let sink = null;
+        if (spawnPromptFile) { try { sink = spawnPromptFile.createSink({ engine: 'claude', bin: engineInstall.resolveBinary('claude', env), env, home: appDataDir(home), log: () => {} }); } catch { sink = null; } }
+        try { plan = agentRunner.buildSpawn({ command: 'claude', agentId: `probe-clh-${cols}`, cwd: work, disallowSubagent: true }, env, ARGS.app, sink ? { promptFile: sink } : {}); } catch (e) { planErr = String(e && e.message || e).slice(0, 300); }
+        if (plan && plan.trust && plan.trust.pending) { try { agentRunner.ensureEngineTrusted(plan.key, plan.cwd, plan.env); } catch { /* measured below */ } }
+      });
+      const target = plan ? paneTarget(plan) : null;
+      if (!target) { srv.close(); report(id, false, { plan_error: planErr, resolved: null }); continue; }
+      const settingsIdx = plan.argv.indexOf('--settings');
+      let hookEvents = null;
+      try { hookEvents = settingsIdx >= 0 ? Object.keys(JSON.parse(fs.readFileSync(plan.argv[settingsIdx + 1], 'utf8')).hooks || {}).sort() : null; } catch { hookEvents = null; }
+      const paneEnv = { ...plan.env, AGENTSPACE_PANE_ID: paneId, AGENTSPACE_BRIDGE_PORT: String(port), AGENTSPACE_BRIDGE_TOKEN: token };
+      for (const k of Object.keys(paneEnv)) if (/^AGENT[_]?DESK_(BRIDGE|PANE)/.test(k)) delete paneEnv[k];
+      const s = spawnPane(target.file, target.argv, { cwd: work, env: paneEnv, cols, rows: 32, rawCap: 8 << 20 });
+      const box = () => /❯|Try "|for shortcuts|bypass permissions/.test(liveText(s));
+      await waitFor(() => s.exit || box(), 45000, 250);
+      const boxMs = box() ? Date.now() - s.startedAt : null;
+      await sleep(5000);
+      const reader = () => {
+        const buffer = composerText(s);
+        let state = null; try { state = xd.paneStateOf({ bytes: s.bytes, buffer }); } catch (e) { state = `error: ${String(e && e.message).slice(0, 80)}`; }
+        let diag = null; try { const d = composer.composerDiag(buffer, { ignoreRunning: true, engine: 'claude' }); diag = { verdict: d.verdict, branch: d.branch }; } catch { diag = null; }
+        return { state, diag };
+      };
+      const jobs = [];
+      for (let n = 1; n <= 2 && !s.exit; n++) {
+        const job = `CLHOOK probe job ${n} ${label} ${cols} ${crypto.randomBytes(3).toString('hex')}`;
+        currentJob = job;
+        const before = reader();
+        const from = events.length;
+        const writtenAt = Date.now();
+        s.t.write(`\x1b[200~${job}\x1b[201~`);
+        await sleep(700);
+        const enterAt = Date.now();
+        s.t.write('\r');
+        await waitFor(() => events.slice(from).some((e) => e.event === 'user-prompt-submit' && e.pane_ok), 15000, 50);
+        const rc = events.slice(from).find((e) => e.event === 'user-prompt-submit' && e.pane_ok) || null;
+        await waitFor(() => events.slice(from).some((e) => /stop/.test(String(e.event)) && e.pane_ok), 30000, 100);
+        const st = events.slice(from).find((e) => /stop/.test(String(e.event)) && e.pane_ok) || null;
+        const after = reader();
+        jobs.push({
+          n, reader_before: before, reader_after: after,
+          receipt_ms_after_enter: rc ? rc.t - enterAt : null, receipt_ms_after_write: rc ? rc.t - writtenAt : null,
+          receipt_signed: rc ? rc.probe_has_job : null, stop_ms_after_enter: st ? st.t - enterAt : null,
+          events: events.slice(from).map((e) => ({ dt: e.t - enterAt, event: e.event, pane_ok: e.pane_ok, auth: e.auth })),
+        });
+        await sleep(3000);
+      }
+      currentJob = '';
+      const wrap = dumpRawAndWrap(s, id);
+      const alive = !s.exit;
+      const kids = alive ? descendants(s.t.pid) : [];
+      if (alive) treeKill.killPaneTreesSync([s.t]);
+      await waitFor(() => s.exit, 10000);
+      await sleep(1500);
+      const left = stillAlive(kids); reap(left);
+      srv.close();
+      fs.writeFileSync(path.join(ARGS.out, `${id}.events.json`), `${JSON.stringify(events.map((e) => ({ ...e, t: e.t - s.startedAt })), null, 1)}\n`);
+      const allPane = events.length > 0 && events.every((e) => e.pane_ok && e.auth);
+      const pass = jobs.length === 2 && allPane && jobs.every((j) => j.receipt_ms_after_enter != null && j.receipt_ms_after_enter <= 10000 && j.receipt_signed === true);
+      report(id, pass, {
+        expect: 'every hook event carries this pane id; the prompt receipt of each job arrives within 10 s of Enter and its signature contains the job',
+        cols, box_ms: boxMs, hook_events_in_settings: hookEvents, events_total: events.length, all_events_this_pane: allPane,
+        jobs, wrap, conpty_dll: CONPTY_DLL, leftover: left.map((p) => p.name),
+      });
+    }
+  }
+}
+
 // ---------- agyping ----------
 // Antigravity "signed in -> connected" check, run by the app's own engineAuthGate with a FAKE
 // agy binary: a .cmd shim (like an npm-installed CLI) that prints a canned answer to `-p` and
@@ -1123,7 +1238,7 @@ function versionOf(binDir) {
 
 (async () => {
   const want = (id) => !ARGS.only || ARGS.only.includes(id);
-  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude], ['cldeliver', scenarioClDeliver], ['agyping', scenarioAgyPing]];
+  const steps = [['tree', scenarioTree], ['storm', scenarioStorm], ['burst', scenarioBurst], ['chars', scenarioChars], ['codex', scenarioCodex], ['opencode', scenarioOpencode], ['ocstart', scenarioOpencodeStart], ['ocreader', scenarioOcReader], ['ocdeliver', scenarioOcDeliver], ['claude', scenarioClaude], ['cldeliver', scenarioClDeliver], ['clhook', scenarioClHook], ['agyping', scenarioAgyPing]];
   for (const [id, fn] of steps) {
     if (!want(id)) continue;
     try { await fn(); } catch (e) { report(`${id}-crashed`, false, { error: String(e && e.stack || e).slice(0, 1500) }); }
