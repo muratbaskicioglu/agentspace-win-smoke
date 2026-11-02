@@ -57,7 +57,8 @@ function cleanEnv() {
 /** Bir koşum (senaryo × kol): yalıtılmış HOME, kanca dosyası, kayıt. */
 function makeRun(sc, arm) {
   const T0 = Date.now();
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `sg-${sc.id}-${arm}-`)));
+  // .native: Windows koşucusunda TEMP 8.3 kısa adla gelir (RUNNER~1); claude uzun adı kullanır.
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `sg-${sc.id}-${arm}-`)));
   const HOME = path.join(base, 'home');
   const WS = path.join(base, 'ws');
   const CFG = path.join(HOME, '.claude');
@@ -74,8 +75,15 @@ function makeRun(sc, arm) {
     hasCompletedOnboarding: true, lastOnboardingVersion: '2.1.316', theme: 'dark', autoUpdates: false, numStartups: 5,
     bypassPermissionsModeAccepted: true,
     customApiKeyResponses: { approved: [KEY.slice(-20)], rejected: [] },
-    projects: { [WS]: { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true, allowedTools: [] } },
+    projects: {},
   };
+  // Klasör güveni: claude projeleri yol anahtarıyla tutar; Windows'ta biçim (\\ ya da /, sürücü harfi
+  // büyük/küçük) sürüme göre değişir. Eşleşmezse "Is this a project you trust?" çıkar ve imleç
+  // "No, exit" üstündedir — ekran kolu hiç başlamaz. Bütün biçimleri yaz.
+  const trust = { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true, allowedTools: [] };
+  const keys = new Set([WS, WS.replace(/\\/g, '/')]);
+  for (const k of [...keys]) if (/^[A-Za-z]:/.test(k)) { keys.add(k[0].toLowerCase() + k.slice(1)); keys.add(k[0].toUpperCase() + k.slice(1)); }
+  for (const k of keys) cfg.projects[k] = trust;
   for (const f of [path.join(HOME, '.claude.json'), path.join(CFG, '.claude.json')]) fs.writeFileSync(f, JSON.stringify(cfg));
   const masks = [[base, '<RUN>'], [os.homedir(), '<HOME>']];
   if (process.platform === 'win32') masks.push([base.replace(/\\/g, '/'), '<RUN>'], [base.replace(/\\/g, '\\\\'), '<RUN>']);
