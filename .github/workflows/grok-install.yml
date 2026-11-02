@@ -1,8 +1,9 @@
 # Grok Build CLI on Windows: the vendor PowerShell installer, run the way AgentSpace runs it,
 # then the sign-in up to the login screen (never completed). See scripts/grokInstallProbe.cjs.
+# macOS / Linux: the npm install the app runs + the same sign-in arm (scripts/grokLoginProbePosix.cjs).
 #
 # REPO RULE: no app source code and no unreleased build ever goes into this repo.
-# This workflow downloads only the public Grok Build installer script and runs a test script.
+# This workflow downloads only the public Grok Build installer script / npm package and runs test scripts.
 #
 # Security notes:
 # - Manual trigger only. No push / pull_request / schedule triggers.
@@ -65,5 +66,40 @@ jobs:
         with:
           name: grok-install-${{ matrix.runner }}-${{ github.run_id }}
           path: grok-install
+          if-no-files-found: warn
+          retention-days: 7
+
+  posix:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: probe
+        shell: bash
+        run: node scripts/grokLoginProbePosix.cjs --out grok-login --version 1.0.70
+
+      - name: summary
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          if [ -f grok-login/evidence.txt ]; then tee -a "$GITHUB_STEP_SUMMARY" < grok-login/evidence.txt; fi
+
+      - name: upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: grok-login-${{ matrix.runner }}-${{ github.run_id }}
+          path: grok-login
           if-no-files-found: warn
           retention-days: 7
