@@ -290,12 +290,45 @@ const LONG_TEXT = Array.from({ length: 40 }, (_, i) => `${i + 1}. Adım · ${CAR
 // carries the character, then its release. TECHNIQUE arm only (the probe's own encoding of the
 // Windows protocol, not app code): measures whether ConPTY + Codex take a symbol sent this way.
 // Letters and astral characters stay as text (they already arrive: AS-4437 run 41209725832).
+// Older ConPTY reads its input 256 bytes at a time and drops an escape sequence that is cut
+// at the end of a read; the rest then arrives as text (run 41384416301: `⛔;0;9940;0;0;1_` at
+// byte 256, `✓;0;1_` at byte 512). So no escape sequence may cross a 256-byte line, counted
+// from the start of the write: a gap of 14+ bytes gets an empty key release (Vk 0, char 0),
+// a smaller gap is closed with leading zeros in the block's last sequence, or (block has only
+// text) an empty release goes at the block start and the text moves over the line.
 const w32key = (code) => `\x1b[0;0;${code};1;0;1_\x1b[0;0;${code};0;0;1_`;
+const w32fill = (n) => `\x1b[${'0'.repeat(n - 13)};0;0;0;0;1_`;
 function w32keys(text) {
-  return [...String(text)].map((ch) => {
-    const c = ch.codePointAt(0);
-    return c >= 0xa0 && c <= 0xffff && !/\p{L}/u.test(ch) ? w32key(c) : ch;
-  }).join('');
+  const parts = [];
+  const t = String(text);
+  for (let i = 0; i < t.length;) {
+    const m = t[i] === '\x1b' ? /^\x1b\[[0-9;?]*[ -/]*[@-~]/.exec(t.slice(i, i + 64)) : null;
+    if (m) { parts.push([m[0], true]); i += m[0].length; continue; }
+    const ch = String.fromCodePoint(t.codePointAt(i)); const c = ch.codePointAt(0);
+    parts.push(c >= 0xa0 && c <= 0xffff && !/\p{L}/u.test(ch) ? [w32key(c), true] : [ch, false]);
+    i += ch.length;
+  }
+  const out = []; // [text, isSeq, bytes]
+  let pos = 0;
+  const total = () => out.reduce((n, o) => n + o[2], 0);
+  const add = (str, seq, at = out.length) => { out.splice(at, 0, [str, seq, Buffer.byteLength(str)]); pos = total(); };
+  for (const [str, seq] of parts) {
+    const len = Buffer.byteLength(str); const p = pos % 256;
+    if (!seq || p === 0 || p + len <= 256) { out.push([str, seq, len]); pos += len; continue; }
+    const gap = 256 - p; const blockStart = pos - p;
+    if (gap >= 14) { add(w32fill(gap), true); add(str, true); continue; }
+    let start = pos; let last = -1; let first = out.length;
+    for (let i = out.length - 1; i >= 0; i--) {
+      start -= out[i][2];
+      if (start < blockStart) break;
+      first = i;
+      if (out[i][1] && last < 0) last = i;
+    }
+    if (last >= 0) { out[last][0] = `\x1b[${'0'.repeat(gap)}${out[last][0].slice(2)}`; out[last][2] += gap; pos += gap; }
+    else add(w32fill(14), true, first);
+    add(str, true);
+  }
+  return out.map((o) => o[0]).join('');
 }
 // The app's own writer for an engine pane. Newer builds wrap a pane's pty write on Windows
 // (platform/winConsoleInput.cjs, AS-4437); without the module text goes as it is, like those builds.
