@@ -115,9 +115,9 @@ async function rollback(root, backup, stamp) {
     const backup = makeTree(run, 'node.yedek-1', 'ESKI');
     const h = await holdExclusive(path.join(backup, 'node.exe'), 5000);
     const r = await rollback(root, backup, 2);
+    await h.done; // read only after the lock is gone: a locked file reads as null
     log(`D long lock on backup: ${JSON.stringify(r)} · root=${read(root)} · backup=${read(backup)}`);
     expect(r.result === 'geri-alma-dustu' && read(root) === 'YENI-BOZUK' && read(backup) === 'ESKI', 'D long lock: geri-alma-dustu, root NOT empty, backup kept');
-    await h.done;
   }
 
   // E) Long lock (5 s) on the NEW folder: the first step fails, nothing moves.
@@ -127,9 +127,9 @@ async function rollback(root, backup, stamp) {
     const backup = makeTree(run, 'node.yedek-1', 'ESKI');
     const h = await holdExclusive(path.join(root, 'node.exe'), 5000);
     const r = await rollback(root, backup, 2);
+    await h.done;
     log(`E long lock on root: ${JSON.stringify(r)} · root=${read(root)} · backup=${read(backup)}`);
     expect(r.result === 'geri-alma-dustu' && read(root) === 'YENI-BOZUK' && read(backup) === 'ESKI', 'E long lock on root: geri-alma-dustu, root NOT empty');
-    await h.done;
   }
 
   // F) Control arm: the OLD order (rm root, then rename backup) under the same long lock on backup.
