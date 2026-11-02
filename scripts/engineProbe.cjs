@@ -1231,7 +1231,7 @@ async function scenarioClStop() {
         jobs.push({
           n, reader_before: before, reader_during: during, reader_at_stop: atStop, reader_after_1500: after,
           receipt_ms_after_write: rc ? rc.t - writtenAt : null, stop_ms_after_enter: st ? st.t - enterAt : null,
-          events: events.slice(from).map((e) => ({ dt: e.t - enterAt, event: e.event, pane_ok: e.pane_ok, auth: e.auth, raw_off: e.raw_off, quiet_ms: e.quiet_ms })),
+          events: events.slice(from).map((e) => ({ dt: e.t - enterAt, t_ms: e.t - s.startedAt, event: e.event, pane_ok: e.pane_ok, auth: e.auth, raw_off: e.raw_off, quiet_ms: e.quiet_ms })),
         });
         await sleep(1500);
       }
@@ -1244,10 +1244,16 @@ async function scenarioClStop() {
       const left = stillAlive(kids); reap(left);
       bridge.close(); fake.close();
       fs.writeFileSync(path.join(ARGS.out, `${id}.api.json`), `${JSON.stringify(api.map((a) => ({ ...a, t: a.t - s.startedAt })), null, 1)}\n`);
-      const turned = jobs.length === 3 && jobs.every((j) => j.stop_ms_after_enter != null);
+      // Previous turn's Stop → this job's prompt receipt (the app's 10 s delivery window).
+      for (let i = 1; i < jobs.length; i++) {
+        const st = jobs[i - 1].events.find((e) => e.event === 'stop' && e.pane_ok);
+        const rc = jobs[i].events.find((e) => e.event === 'user-prompt-submit' && e.pane_ok);
+        jobs[i].receipt_ms_after_prev_stop = st && rc ? rc.t_ms - st.t_ms : null;
+      }
+      const turned = jobs.length === 3 && jobs.every((j) => j.stop_ms_after_enter != null) && jobs.slice(1).every((j) => j.receipt_ms_after_prev_stop != null && j.receipt_ms_after_prev_stop <= 10000);
       const stale = jobs.filter((j) => j.reader_after_1500.state === 'busy').length;
       report(id, turned, {
-        expect: 'three real turns against a local fake API: each job gets a Stop hook; the reader state 1.5 s after Stop is recorded (busy = stale)',
+        expect: 'three real turns against a local fake API: each job gets a Stop hook and the next job\'s receipt comes within 10 s of the previous Stop; the reader state 1.5 s after Stop is recorded (busy = stale)',
         cols, delay_ms: delayMs, box_ms: boxMs, api_calls: api.length, stale_busy_after_stop: stale,
         jobs, wrap, conpty_dll: CONPTY_DLL, leftover: left.map((p) => p.name),
       });
