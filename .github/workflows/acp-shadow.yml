@@ -87,6 +87,9 @@ jobs:
           npm install --no-audit --no-fund --ignore-scripts --prefix "$root/pty" "node-pty@$V_NODE_PTY" 2>&1 | tail -2
           npm ls --prefix "$root/claude" --depth=0 | tail -n +2
           npm ls --prefix "$root/pty" --depth=0 | tail -n +2
+          # --ignore-scripts skips node-pty's postinstall, which sets +x on the macOS spawn-helper
+          # (without it: "posix_spawnp failed"). The file comes from the same npm package.
+          if [ "$RUNNER_OS" = "macOS" ]; then chmod +x "$root"/pty/node_modules/node-pty/prebuilds/darwin-*/spawn-helper; ls -l "$root"/pty/node_modules/node-pty/prebuilds/darwin-*/spawn-helper; fi
           echo "SHADOW_ROOT=$root" >> "$GITHUB_ENV"
 
       - name: install official Claude Code CLI (Windows, native installer)
