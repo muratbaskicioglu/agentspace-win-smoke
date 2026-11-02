@@ -57,10 +57,10 @@ function sahteMakine() {
 function kostur(m, env) {
   const pwsh = kosturucu();
   assert.ok(pwsh, 'PowerShell bulunamadı (AS_PWSH ver) — test ATLANMAZ');
-  // .cmd'nin tamamı geçerli PowerShell'dir (üst kısım <# … #> yorumu); .ps1 kopyasıyla -File koşulur.
-  const ps1 = path.join(m.kok, 'sifirla.ps1');
-  fs.writeFileSync(ps1, fs.readFileSync(BETIK));
-  const r = spawnSync(pwsh, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1], {
+  // .cmd'nin kendi açılış satırıyla AYNI: dosya UTF-8 okunup iex edilir (üst kısım <# … #> yorumu).
+  // -File KULLANILMAZ: Windows PowerShell 5.1 BOM'suz dosyayı ANSI okur, Türkçe metin bozulur.
+  const r = spawnSync(pwsh, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
+    'iex ([IO.File]::ReadAllText($env:AS_SIFIRLA_DOSYA, [Text.Encoding]::UTF8))'], {
     encoding: 'utf8',
     cwd: m.kok,
     timeout: Number(process.env.AS_SIFIRLA_TEST_SURE_MS) || 120000, // yüklü macOS'ta Get-Process yavaş
@@ -69,6 +69,7 @@ function kostur(m, env) {
       USERPROFILE: m.U, APPDATA: m.R, LOCALAPPDATA: m.L,
       AS_SIFIRLA_SUREC_ADLARI: 'yok-boyle-bir-surec-sifirla',
       AS_SIFIRLA_BEKLE: '0',
+      AS_SIFIRLA_DOSYA: BETIK,
       ...env,
     },
   });
