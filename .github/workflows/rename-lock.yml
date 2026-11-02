@@ -1,0 +1,68 @@
+# Windows rename-under-lock probe for AgentSpace's setup-repair rollback (AS-4667).
+# See scripts/renameLockProbe.cjs: plain Node fs + a PowerShell file handle, throwaway folders.
+#
+# REPO RULE: no app source code and no unreleased build ever goes into this repo.
+# This workflow downloads nothing and runs one test script.
+#
+# Security notes:
+# - Manual trigger only. No push / pull_request / schedule triggers.
+# - No secrets, no network use by the script. Throwaway folders under RUNNER_TEMP.
+# - Actions are pinned to full commit SHAs. Read-only token.
+# - Standard runners only (free on a public repo).
+name: rename lock
+
+run-name: rename lock ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: 'Shown in the run name only, so the caller can find its run (not used by any step)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rename-lock
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: probe
+        shell: pwsh
+        run: |
+          node scripts/renameLockProbe.cjs --out rename-lock
+          exit $LASTEXITCODE
+
+      - name: summary
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          if (Test-Path rename-lock/evidence.txt) { Get-Content rename-lock/evidence.txt | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY }
+
+      - name: upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rename-lock-${{ matrix.runner }}-${{ github.run_id }}
+          path: rename-lock
+          if-no-files-found: warn
+          retention-days: 7
