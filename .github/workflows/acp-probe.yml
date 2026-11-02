@@ -1,0 +1,149 @@
+# REPO RULE: no app source code and no unreleased build ever goes into this repo.
+# Only published packages from npm / the official Claude installer + test scripts.
+#
+# ACP turn probe (Phase 0 of the ACP gate): three engines over the Agent Client Protocol,
+# each against a LOCAL FAKE model server, on Windows Server 2025, Windows Server 2022 and macOS.
+#   claude   = @agentclientprotocol/claude-agent-acp driving the official Claude Code CLI
+#   codex    = @agentclientprotocol/codex-acp (bundled @openai/codex)
+#   opencode = opencode-ai `opencode acp`
+# Modes: turn (prompt + MCP tool + permission request + end_turn), cancel, resume (kill + session/load), limit (429),
+# hooks (Claude Code hooks + system prompt under the adapter). Each cell runs once.
+#
+# Security notes (same rules as the other workflows here):
+# - Manual trigger only. No push / pull_request / schedule triggers.
+# - No secrets. Throwaway HOME per cell, FAKE API keys, model calls go to 127.0.0.1 only.
+# - Inputs reach the shell only through env vars and are checked against strict patterns.
+# - Actions are pinned to full commit SHAs. Only names, times, counts and booleans are saved.
+name: acp probe
+
+run-name: acp probe ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      claude_acp:
+        description: '@agentclientprotocol/claude-agent-acp version'
+        required: false
+        type: string
+        default: '0.99.1'
+      codex_acp:
+        description: '@agentclientprotocol/codex-acp version'
+        required: false
+        type: string
+        default: '2.5.0'
+      opencode:
+        description: 'opencode-ai version'
+        required: false
+        type: string
+        default: '1.19.5'
+      claude_cli:
+        description: 'Official Claude Code CLI version (native installer)'
+        required: false
+        type: string
+        default: '2.1.316'
+      request_id:
+        description: 'Shown in the run name only'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acp-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: acp probe ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      V_CLAUDE_ACP: ${{ inputs.claude_acp }}
+      V_CODEX_ACP: ${{ inputs.codex_acp }}
+      V_OPENCODE: ${{ inputs.opencode }}
+      V_CLAUDE_CLI: ${{ inputs.claude_cli }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: check inputs
+        run: |
+          for v in "$V_CLAUDE_ACP" "$V_CODEX_ACP" "$V_OPENCODE" "$V_CLAUDE_CLI"; do
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version $v"; exit 1; }
+          done
+          node --version; npm --version; uname -a
+
+      - name: install adapters from npm (pinned, one prefix each, like an app bundling them)
+        run: |
+          set -e
+          root="$(cygpath -m "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/acp"; mkdir -p "$root"
+          t0=$(date +%s)
+          npm install --no-audit --no-fund --prefix "$root/claude" "@agentclientprotocol/claude-agent-acp@$V_CLAUDE_ACP" 2>&1 | tail -2
+          t1=$(date +%s)
+          npm install --no-audit --no-fund --prefix "$root/codex" "@agentclientprotocol/codex-acp@$V_CODEX_ACP" 2>&1 | tail -2
+          t2=$(date +%s)
+          npm install --no-audit --no-fund --prefix "$root/opencode" "opencode-ai@$V_OPENCODE" 2>&1 | tail -2
+          t3=$(date +%s)
+          echo "install_seconds claude=$((t1-t0)) codex=$((t2-t1)) opencode=$((t3-t2))"
+          for e in claude codex opencode; do echo "--- $e"; npm ls --prefix "$root/$e" --depth=0 2>/dev/null | tail -n +2; done
+          echo "ACP_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: install official Claude Code CLI (Windows, native installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ([scriptblock]::Create((Invoke-RestMethod -UseBasicParsing https://claude.ai/install.ps1))) $env:V_CLAUDE_CLI | Out-Host
+          $exe = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+          if (-not (Test-Path $exe)) { throw "claude.exe not installed" }
+          & $exe --version | Out-Host
+          "CLAUDE_EXE=$exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: install official Claude Code CLI (macOS, native installer)
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          curl -fsSL https://claude.ai/install.sh | bash -s "$V_CLAUDE_CLI"
+          exe="$(cd ~/.local/bin && pwd)/claude"
+          "$exe" --version
+          echo "CLAUDE_EXE=$exe" >> "$GITHUB_ENV"
+
+      - name: run probe matrix (3 engines x turn/cancel/resume/limit + claude hooks)
+        run: |
+          out="$GITHUB_WORKSPACE/acp-probe-${{ matrix.os }}"
+          node scripts/acp/acpProbe.cjs --all --modes turn,cancel,resume,limit,hooks \
+            --prefix-claude "$ACP_ROOT/claude" --prefix-codex "$ACP_ROOT/codex" --prefix-opencode "$ACP_ROOT/opencode" \
+            --claude-exe "$CLAUDE_EXE" --out "$out"
+          for f in "$out"/*.txt; do echo "::group::$(basename "$f")"; cat "$f"; echo "::endgroup::"; done
+
+      - name: no leftover engine processes
+        if: ${{ !cancelled() }}
+        run: |
+          sleep 10
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -NoProfile -Command '$l = Get-CimInstance Win32_Process | Where-Object { $_.Name -match "^(codex|opencode|claude)(\.exe)?$" -or ($_.Name -eq "node.exe" -and $_.CommandLine -match "acp|mcpEcho") }; $l | Select-Object ProcessId, Name | Format-Table | Out-Host; "leftover_count $(@($l).Count)"'
+          else
+            ps -axo pid,comm | grep -E "codex|opencode|claude|mcpEcho" | grep -v grep || true
+          fi
+
+      - name: upload evidence (txt, json)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acp-probe-${{ matrix.os }}-${{ github.run_id }}
+          path: acp-probe-${{ matrix.os }}
+          if-no-files-found: warn
+          retention-days: 7
