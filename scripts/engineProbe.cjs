@@ -655,11 +655,29 @@ async function scenarioOpencode() {
 // the app's own input box reader (leaderComposer.composerDiag) says what it sees. The app
 // writes a job into a pane only when the reader says 'empty'. Two widths: wide (120) and
 // narrow (45 and 36 columns, about a medium and a small pane). No key, no login: OpenCode uses its free default.
+// The pane width goes through the app's own size floor (ptyResizeGate.engineSizeFloor), the same
+// call the app makes before it starts or resizes a pane: below the engine's minimum width the app
+// keeps the pty at that minimum and shows a "pane too narrow" strip. For each width under the
+// floor there is also a 'raw' control arm: the pty really gets that width (what happens without
+// the floor). It is measured only (OpenCode 1.18.18's Bun crashes there, outside the app).
+// PROBE_OCR_CONTROL=0 skips the control arms.
+function appPaneSize(engine, cols, rows) {
+  const gate = appOpt('ptyResizeGate.cjs');
+  if (gate.loadError || typeof gate.engineSizeFloor !== 'function') return { cols, rows, floored: false, gate: 'not in this build' };
+  const r = gate.engineSizeFloor(engine, cols, rows, {});
+  return { cols: r.cols, rows: r.rows, floored: !!r.floored, gate: 'app' };
+}
 async function scenarioOcReader() {
   const widths = (process.env.PROBE_OCR_COLS || '120,45,36').split(',').map(Number).filter((n) => n >= 20 && n <= 300);
+  const arms = [];
+  for (const cols of widths) {
+    const size = appPaneSize('opencode', cols, 32);
+    arms.push({ cols, size, control: false });
+    if (size.floored && process.env.PROBE_OCR_CONTROL !== '0') arms.push({ cols, size: { cols, rows: 32, floored: false, gate: 'raw (control arm)' }, control: true });
+  }
   for (const { label, dir } of ARGS.opencode) {
-    for (const cols of widths) {
-      const id = `ocreader-${label}-c${cols}`;
+    for (const { cols, size, control } of arms) {
+      const id = `ocreader-${label}-c${cols}${control ? '-raw' : ''}`;
       const home = isoHome(`ocr-${label}-${cols}`);
       const work = path.join(home, 'work'); fs.mkdirSync(work);
       const env = envFor(home, dir, {});
@@ -667,7 +685,7 @@ async function scenarioOcReader() {
       try { plan = agentRunner.buildSpawn({ command: 'opencode', agentId: 'probe-reader', cwd: work, disallowSubagent: true }, env, ARGS.app, {}); } catch (e) { planErr = e.message; }
       const target = plan ? paneTarget(plan) : null;
       if (!target) { report(id, false, { plan_error: planErr, resolved: null }); continue; }
-      const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols, rows: 32, rawCap: 8 << 20 });
+      const s = spawnPane(target.file, target.argv, { cwd: work, env: plan.env, cols: size.cols, rows: size.rows, rawCap: 8 << 20 });
       const drawn = await waitFor(() => ocReady(s) || s.exit, 120000, 500);
       const drawnMs = drawn && !s.exit ? Date.now() - s.startedAt : null;
       await sleep(6000); // the status row (agent, model) settles after the box
@@ -686,9 +704,9 @@ async function scenarioOcReader() {
       await waitFor(() => s.exit, 10000);
       await sleep(2000);
       const left = stillAlive(before); reap(left);
-      report(id, !!reads.plain && reads.plain.verdict === 'empty', {
-        expect: "reader says 'empty' on an idle input box (needed before the app writes a job)",
-        version: versionOf(dir), cols, box_drawn_ms: drawnMs, alive_at_read: alive,
+      report(id, control ? true : alive && !!reads.plain && reads.plain.verdict === 'empty', {
+        expect: control ? 'measured only (control arm: no size floor)' : "pane alive and reader says 'empty' on an idle input box (needed before the app writes a job)",
+        version: versionOf(dir), cols, pty_cols: size.cols, size_floored: size.floored, size_gate: size.gate, exit: alive ? null : s.exit, box_drawn_ms: drawnMs, alive_at_read: alive,
         ghost, ghost_has_u2026: ghost.includes('…'), reads, wrap, overlay: ARGS.overlay ? ARGS.overlayFiles : null, leftover: left.map((p) => p.name),
       });
     }
