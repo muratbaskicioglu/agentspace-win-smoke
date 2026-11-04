@@ -94,7 +94,10 @@ function atimHukmu({ govde, gonderilen, alinan }) {
   const sent = normal(gonderilen);
   const got = (Array.isArray(alinan) ? alinan : []).map(normal).filter(Boolean);
   if (!sent) sebepler.push('urun_yazmadi');
-  else if (!sent.includes(normal(govde))) sebepler.push('sarmalayici_govdeyi_kesti');
+  else if (!sent.includes(normal(govde))) {
+    // Sözcükler duruyor, satır sonları boşluğa inmişse kusur ayrı adlanır: metin kesilmedi, biçimi bozuldu.
+    sebepler.push(sent.includes(normal(govde).replace(/\s*\n\s*/g, ' ')) ? 'satir_sonu_dustu' : 'sarmalayici_govdeyi_kesti');
+  }
   if (sent) {
     if (got.length === 0) sebepler.push('gonderilmedi');
     else if (got.length > 1) sebepler.push('cift_mesaj');

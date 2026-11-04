@@ -44,11 +44,15 @@ const say = (o) => console.log(`TM ${JSON.stringify(o)}`);
 const hamDosya = (motor) => path.join(OUT, `ham-${KULVAR}-${SURUM}-${motor}.jsonl`);
 const sha = (s) => crypto.createHash('sha256').update(String(s), 'utf8').digest('hex').slice(0, 16);
 
+// Hücre ilk kırmızıda kırmızıdır; üç kırmızıdan sonrası hükmü değiştirmez, tüm kusurlu kolda koşuyu 6 saat tavanına taşır.
+// Üçten az kırmızı ×10'u tamamlar: aralıklı kusurun sıklığı tabloda kalır.
+const KIRMIZI_TAVAN = 3;
+const anaKirmizi = (d) => d.filter((x) => x.kol === 'ana' && !x.gecti).length;
 function hucreDefteri(motor, hucreId) { return jsonl(hamDosya(motor)).filter((x) => x.hucre === hucreId); }
 function hucreTamam(motor, hucreId) {
   const d = hucreDefteri(motor, hucreId);
   if (d.some((x) => (x.sebepler || []).includes('motor_acilmadi'))) return true;
-  if (d.filter((x) => x.kol === 'ana').length < TEKRAR) return false;
+  if (d.filter((x) => x.kol === 'ana').length < TEKRAR && anaKirmizi(d) < KIRMIZI_TAVAN) return false;
   return !POZITIF || ['bayt', 'enter'].every((z) => d.some((x) => x.kol === 'pozitif' && x.sabotaj === z));
 }
 
@@ -442,7 +446,8 @@ async function cocuk(hucreId) {
   // çocuk sabotaj atımına hiç ulaşamaz (koşu 41881153221).
   let taze = true;
   const yeniden = async () => { paneKapat(pane); await sleep(500); pane = paneAc(); acildi = await hazirla(pane); taze = true; };
-  for (let i = anaBitti; i < TEKRAR; i++) {
+  let kirmizi = anaKirmizi(onceki);
+  for (let i = anaBitti; i < TEKRAR && kirmizi < KIRMIZI_TAVAN; i++) {
     if (!acildi || pane.cikis !== null) await yeniden();
     if (!acildi) {
       fs.appendFileSync(hamDosya(motor), `${JSON.stringify({ surum: SURUM, kulvar: KULVAR, hucre: hucreId, motor, giris, mesaj, kol: 'ana', gecti: false, sebepler: ['motor_acilmadi'], cikis: pane.cikis, ekran: canli(pane).slice(-400) })}\n`);
@@ -452,7 +457,7 @@ async function cocuk(hucreId) {
     const hk = await atim(pane, 'ana', null);
     await sessiz(pane);
     // Geçmeyen atımın kutuda bıraktığı metin sonrakini kirletmesin: temiz pane ile sür.
-    if (!hk.gecti) await yeniden();
+    if (!hk.gecti) { kirmizi += 1; await yeniden(); }
   }
   if (POZITIF && acildi) {
     for (const sabotaj of ['bayt', 'enter']) {
