@@ -96,7 +96,12 @@ function yakalayici() {
         const j = JSON.parse(govdeAc(ham, kayit.kodlama).toString('utf8'));
         const list = Array.isArray(j.messages) ? j.messages : Array.isArray(j.input) ? j.input : [];
         const ms = list.filter((m) => m && m.role === 'user');
-        kayit.liste = list.length; kayit.user = ms.length;
+        kayit.liste = list.length; kayit.user = ms.length; kayit.sn = Math.round(process.uptime() * 10) / 10;
+        kayit.ogeler = list.map((m) => {
+          const c = m && m.content;
+          const t = typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (x && x.text) || '').join('') : '';
+          return `${(m && (m.role || m.type)) || '?'}:${Buffer.byteLength(t, 'utf8')}:${t.slice(0, 24).replace(/\s+/g, ' ')}`;
+        });
         const last = ms[ms.length - 1];
         if (last) {
           const c = last.content;
@@ -110,6 +115,7 @@ function yakalayici() {
       res.end('{"error":{"message":"tm probe","type":"invalid_request_error"}}');
     });
   });
+  srv.on('upgrade', (req, sock) => { iz.push({ yol: req.url, upgrade: req.headers.upgrade || true, sn: Math.round(process.uptime() * 10) / 10 }); sock.destroy(); });
   return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ got, iz, port: srv.address().port, stop: () => srv.close() })));
 }
 
@@ -305,6 +311,7 @@ async function cocuk(hucreId) {
   async function atim(p, kol, sabotaj) {
     const ev = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-oda-'));
     const onceki = defter().length;
+    const atimBasi = Math.round(process.uptime() * 10) / 10;
     const yazilan = [];
     let enterYutuldu = 0;
     const entry = p.entry;
@@ -384,7 +391,7 @@ async function cocuk(hucreId) {
       kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200),
       // Ham bayt: yalnız sabit prob metni taşır, kişisel veri yok.
       gonderilen, alinan,
-      ...(hukum.gecti ? {} : { yakalayici: cap.iz.slice(-6) }),
+      ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, yakalayici: cap.iz.slice(-6) }),
       ...(hukum.gecti ? {} : { ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-12).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>').replace(/\/(Users|home|private|var|tmp)\/[^\s]*/g, '<yol>') }),
     };
     fs.appendFileSync(hamDosya(motor), `${JSON.stringify(satir)}\n`);
