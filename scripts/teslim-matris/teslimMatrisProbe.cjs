@@ -313,6 +313,7 @@ async function cocuk(hucreId) {
     const onceki = defter().length;
     const atimBasi = Math.round(process.uptime() * 10) / 10;
     const yazilan = [];
+    const anlik = [];
     let enterYutuldu = 0;
     const entry = p.entry;
     const dio = {
@@ -328,6 +329,12 @@ async function cocuk(hucreId) {
         if (typeof d === 'string' && /[^\r\n]/.test(d)) { entry.lastMachineTextAt = Date.now(); entry.lastMachineText = d; }
         yazilan.push(typeof d === 'string' ? d.length : 0);
         p.child.write(d);
+        // Teşhis: yazımdan sonra kutu ne gösterdi? Mesajın nerede kaybolduğu kırmızı satırda okunsun.
+        for (const ms of [300, 2000]) {
+          setTimeout(() => {
+            try { anlik.push({ yazim: yazilan.length, ms, bayt: p.bytes, kutu: kutu(p).split('\n').filter((l) => l.trim()).slice(-2).join(' | ').slice(-160) }); } catch { /* */ }
+          }, ms);
+        }
         return true;
       },
       sleep,
@@ -391,7 +398,7 @@ async function cocuk(hucreId) {
       kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200),
       // Ham bayt: yalnız sabit prob metni taşır, kişisel veri yok.
       gonderilen, alinan,
-      ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, yakalayici: cap.iz.slice(-6) }),
+      ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, anlik, yakalayici: cap.iz.slice(-6) }),
       ...(hukum.gecti ? {} : { ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-12).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>').replace(/\/(Users|home|private|var|tmp)\/[^\s]*/g, '<yol>') }),
     };
     fs.appendFileSync(hamDosya(motor), `${JSON.stringify(satir)}\n`);

@@ -1,0 +1,42 @@
+name: latest-kanit
+
+# TESLIM-MATRIS-01: Latest teslim matrisinden geçmeden elle taşındıysa bunu yakalar.
+# `gh release edit --latest` kapıyı dolanabilir; önleyemeyiz, ama kanıt dosyası olmayan Latest burada
+# kırmızı olur ve depo sahibine bildirim gider. Ürün kaynağı ya da sır içermez, yalnız public sürüm okunur.
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  denetle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Latest kanıt taşıyor mu
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Kapıdan önce çıkmış son sürüm. Yeni istisna eklenmez.
+          ISTISNA: v0.4.11
+        run: |
+          set -euo pipefail
+          r=muratbaskicioglu/agentspace-releases
+          tag=$(gh api "repos/$r/releases/latest" --jq .tag_name)
+          echo "Latest: $tag"
+          if [ "$tag" = "$ISTISNA" ]; then echo "kapıdan önce çıkmış sürüm, istisna"; exit 0; fi
+          d=$(mktemp -d)
+          if ! gh release download "$tag" -R "$r" -p teslim-matris-kaniti.json -D "$d"; then
+            echo "::error::$tag teslim matrisi kanıtı taşımıyor: Latest kapıdan geçmeden taşınmış"
+            exit 1
+          fi
+          kanit_tag=$(jq -r .tag "$d/teslim-matris-kaniti.json")
+          kapi=$(jq -r .kapi "$d/teslim-matris-kaniti.json")
+          # promote: stable, beta'nın aynı baytlarıdır; kanıt beta etiketini taşır.
+          if { [ "$kanit_tag" != "$tag" ] && [ "$kanit_tag" != "$tag-beta" ]; } || [ "$kapi" != "0" ]; then
+            echo "::error::$tag kanıtı geçersiz: tag=$kanit_tag kapi=$kapi"
+            exit 1
+          fi
+          echo "kanıt tamam: $tag"

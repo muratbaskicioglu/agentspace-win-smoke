@@ -126,7 +126,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:WANT -cnotmatch '^[0-9a-f]{64}$') { Write-Host "::error::bad sha256"; exit 1 }
-          $ver = $env:TM_TAG.Substring(1)
+          $ver = $env:TM_TAG.Substring(1) -replace '-beta$',''
           $asset = "AgentSpace-Setup-$ver.exe"
           New-Item -ItemType Directory -Force -Path smoke-input | Out-Null
           $dst = Join-Path 'smoke-input' $asset
@@ -149,7 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$WANT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256"; exit 1; }
-          asset="AgentSpace-${TM_TAG#v}-arm64.dmg"
+          ver="${TM_TAG#v}"; asset="AgentSpace-${ver%-beta}-arm64.dmg"
           mkdir -p smoke-input
           curl -fsSL --retry 3 -o "smoke-input/$asset" "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$TM_TAG/$asset"
           [[ "$(shasum -a 256 "smoke-input/$asset" | cut -d' ' -f1)" == "$WANT" ]] || { echo "::error::sha256 mismatch"; exit 1; }
@@ -172,7 +172,7 @@ jobs:
           set -euo pipefail
           case "$TM_RUNNER" in *-arm) arch=arm64; WANT="$WANT_ARM" ;; *) arch=x86_64; WANT="$WANT_X64" ;; esac
           [[ "$WANT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256"; exit 1; }
-          asset="AgentSpace-${TM_TAG#v}-$arch.AppImage"
+          ver="${TM_TAG#v}"; asset="AgentSpace-${ver%-beta}-$arch.AppImage"
           mkdir -p smoke-input
           curl -fsSL --retry 3 -o "smoke-input/$asset" "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$TM_TAG/$asset"
           [[ "$(sha256sum "smoke-input/$asset" | cut -d' ' -f1)" == "$WANT" ]] || { echo "::error::sha256 mismatch"; exit 1; }
