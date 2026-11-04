@@ -60,11 +60,14 @@ function surucu() {
     const t0 = Date.now();
     // Her hücre ayrı süreç: node-pty Windows'ta pane kapanışında süreci düşürebiliyor (0xC0000374). Çocuk
     // defterden kaldığı atımı okur; düşerse sürücü aynı hücreyi sürdürür, ölçüm kaybolmaz.
-    let r; let deneme = 0;
+    // Sınır ilerlemeyen denemeye konur: defter büyüdükçe sayaç sıfırlanır, her düşüş ölçümü sürdürür.
+    let r; let bos = 0; let satir = hucreDefteri(h.motor, h.id).length;
     do {
       r = cp.spawnSync(process.execPath, [__filename], { stdio: 'inherit', timeout: 20 * 60_000, env: { ...process.env, TM_COCUK: h.id } });
-      deneme += 1;
-    } while (!hucreTamam(h.motor, h.id) && deneme < TEKRAR + 6);
+      const simdi = hucreDefteri(h.motor, h.id).length;
+      bos = simdi > satir ? 0 : bos + 1;
+      satir = simdi;
+    } while (!hucreTamam(h.motor, h.id) && bos < 6);
     if (!hucreTamam(h.motor, h.id)) {
       fs.appendFileSync(hamDosya(h.motor), `${JSON.stringify({ hucre: h.id, kol: 'ana', gecti: false, sebepler: ['prob_dustu'], cikis: r.status, sinyal: r.signal, surum: SURUM, kulvar: KULVAR })}\n`);
     }
@@ -417,7 +420,7 @@ async function cocuk(hucreId) {
       yazim: yazilan, enter_yutuldu: enterYutuldu, sn: Math.round((Date.now() - t0) / 100) / 10,
       gonderilen_sha: gonderilen == null ? null : sha(K.normal(gonderilen)),
       alinan_sha: alinan.map((a) => sha(K.normal(a))),
-      kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200),
+      kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200).replace(/[A-Za-z]:\\[^\s]*/g, '<yol>'),
       // Ham bayt: yalnız sabit prob metni taşır, kişisel veri yok.
       gonderilen, alinan,
       ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, anlik, yakalayici: cap.iz.slice(-6), motor_izi: motorIzi(p), ham_cikti: hamOzet(p) }),
@@ -435,13 +438,17 @@ async function cocuk(hucreId) {
   const anaBitti = onceki.filter((x) => x.kol === 'ana').length;
   let pane = paneAc();
   let acildi = await hazirla(pane);
-  const yeniden = async () => { paneKapat(pane); await sleep(500); pane = paneAc(); acildi = await hazirla(pane); };
+  // Bu süreçte pane'e henüz atım yapılmadıysa zaten temizdir: kapatıp açmak Windows'ta süreci düşürür ve sürdürülen
+  // çocuk sabotaj atımına hiç ulaşamaz (koşu 41881153221).
+  let taze = true;
+  const yeniden = async () => { paneKapat(pane); await sleep(500); pane = paneAc(); acildi = await hazirla(pane); taze = true; };
   for (let i = anaBitti; i < TEKRAR; i++) {
     if (!acildi || pane.cikis !== null) await yeniden();
     if (!acildi) {
       fs.appendFileSync(hamDosya(motor), `${JSON.stringify({ surum: SURUM, kulvar: KULVAR, hucre: hucreId, motor, giris, mesaj, kol: 'ana', gecti: false, sebepler: ['motor_acilmadi'], cikis: pane.cikis, ekran: canli(pane).slice(-400) })}\n`);
       break;
     }
+    taze = false;
     const hk = await atim(pane, 'ana', null);
     await sessiz(pane);
     // Geçmeyen atımın kutuda bıraktığı metin sonrakini kirletmesin: temiz pane ile sür.
@@ -450,8 +457,9 @@ async function cocuk(hucreId) {
   if (POZITIF && acildi) {
     for (const sabotaj of ['bayt', 'enter']) {
       if (onceki.some((x) => x.kol === 'pozitif' && x.sabotaj === sabotaj)) continue;
-      await yeniden();
+      if (!taze) await yeniden();
       if (!acildi) break;
+      taze = false;
       await atim(pane, 'pozitif', sabotaj);
     }
   }
