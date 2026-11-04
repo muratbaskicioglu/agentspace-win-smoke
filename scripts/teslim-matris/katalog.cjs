@@ -58,6 +58,15 @@ const UYGULANAMAZ = Object.freeze({
   'tel_calisan|uzun4k': 'ürün telefondan 4000 karakter üstünü açıkça reddediyor',
 });
 
+/**
+ * Motorun kendi derlemesi o kulvarda hiç açılmıyor: müşteri de açamaz, ürün yolu ölçülemez.
+ * Yalnız o kulvarda her atım `motor_acilmadi` verdiyse "koşulamadı" yazılır; yeşil sayılmaz, kapıyı da kilitlemez.
+ * Motor bir gün açılırsa hücre kendiliğinden gerçek ölçüme döner; açılmış hücre bu listeden kurtulamaz.
+ */
+const MOTOR_ACILMIYOR = Object.freeze({
+  'windows-11-arm|opencode': 'OpenCode Windows ARM derlemesi açılmıyor: bun:ffi dlopen() bu derlemede yok (OpenCode 1.18.18, koşu 41868642028)',
+});
+
 const hucreKimligi = (motor, giris, mesaj) => `${motor}|${giris}|${mesaj}`;
 
 /** Bir kulvarda ölçülecek tüm hücreler. */
@@ -117,6 +126,6 @@ function hucreHukmu(atimlar, tekrar = TEKRAR) {
 }
 
 module.exports = {
-  MESAJLAR, GIRISLER, MOTORLAR, KULVARLAR, TEKRAR, UYGULANAMAZ, ILKIS_ANAHTARI, ILKIS_METNI,
+  MESAJLAR, GIRISLER, MOTORLAR, KULVARLAR, TEKRAR, UYGULANAMAZ, MOTOR_ACILMIYOR, ILKIS_ANAHTARI, ILKIS_METNI,
   hucreKimligi, hucreler, normal, atimHukmu, hucreHukmu,
 };
