@@ -281,6 +281,8 @@ async function cocuk(hucreId) {
   }
   function paneKapat(p) {
     if (!p) return;
+    // Kendiliğinden kapanmış ConPTY'yi yeniden öldürmek node-pty'yi 0xC0000374 ile düşürür: satır yazılamaz, hüküm kaybolur.
+    if (p.cikis !== null) return;
     try { if (treeKill) treeKill.killPaneTreesSync([p.child]); } catch { /* */ }
     try { p.child.kill(); } catch { /* */ }
     try { p.screen.dispose(); } catch { /* */ }
@@ -293,7 +295,10 @@ async function cocuk(hucreId) {
     const ok = await bekle(() => def.hazir.test(canli(p)) || p.cikis !== null, 90_000, 400);
     await bekle(() => def.mesgul.test(canli(p)) || p.cikis !== null, 6000, 250);
     await sessiz(p);
-    return ok && p.cikis === null;
+    const hazir = ok && p.cikis === null;
+    // Teşhis: motor neden hazır olmadı? Ekran yalnız CLI'nin kendi yazısı; yollar maskeli.
+    if (!hazir) console.error(`TM-TANI ${JSON.stringify({ hazir: ok, cikis: p.cikis, bayt: p.bytes, ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-14).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>') })}`);
+    return hazir;
   }
   async function sessiz(p, ms = 60_000) {
     if (SAHTE) return;
