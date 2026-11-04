@@ -1,0 +1,101 @@
+# Codex on a current Windows console: does a message pasted into the box get sent, and does a later
+# Enter rescue it when it does not? Measures bytes reaching a local capture server.
+#
+# Only a PUBLISHED package (downloaded, sha256 checked) + a test script. No secrets. No product source.
+# Fake key and local capture server: nothing reaches any model. Standard runners only.
+name: teslim codex enter
+
+run-name: teslim codex enter ${{ inputs.tag }} ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release tag'
+        required: true
+        type: string
+      win_sha256:
+        description: 'sha256 of AgentSpace-Setup-<version>.exe'
+        required: true
+        type: string
+      runners:
+        description: 'JSON list of Windows runners'
+        required: false
+        type: string
+        default: '["windows-2025","windows-11-arm"]'
+      repeat:
+        description: 'Sends per case'
+        required: false
+        type: string
+        default: '20'
+      request_id:
+        description: 'Shown in the run name so the caller can find its run'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CODEX_VERSION: '0.162.0'
+      TC_TAG: ${{ inputs.tag }}
+      TC_REPEAT: ${{ inputs.repeat }}
+      TC_RUNNER: ${{ matrix.runner }}
+      WANT: ${{ inputs.win_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/teslim-codex
+
+      - name: package and engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:TC_TAG -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$') { Write-Host "::error::bad tag"; exit 1 }
+          if ($env:WANT -cnotmatch '^[0-9a-f]{64}$') { Write-Host "::error::bad sha256"; exit 1 }
+          if ($env:TC_REPEAT -cnotmatch '^[0-9]{1,2}$') { Write-Host "::error::bad repeat"; exit 1 }
+          if ($env:TC_RUNNER -cnotmatch '^(windows-2025|windows-2022|windows-11-arm)$') { Write-Host "::error::bad runner"; exit 1 }
+          $ver = $env:TC_TAG.Substring(1) -replace '-beta$',''
+          $asset = "AgentSpace-Setup-$ver.exe"
+          New-Item -ItemType Directory -Force -Path smoke-input | Out-Null
+          $dst = Join-Path 'smoke-input' $asset
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$($env:TC_TAG)/$asset" -OutFile $dst -UseBasicParsing
+          $got = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:WANT) { Write-Host "::error::sha256 mismatch"; exit 1 }
+          $p = Start-Process -FilePath (Resolve-Path $dst).Path -ArgumentList '/S' -PassThru -Wait
+          "installer exit $($p.ExitCode)"
+          $exe = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Depth 2 -Filter 'AgentSpace.exe' -File | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::AgentSpace.exe not found"; exit 1 }
+          "AS_EXE=$($exe.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "AS_ASAR=$(Join-Path $exe.DirectoryName 'resources\app.asar')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $dir = Join-Path $env:RUNNER_TEMP 'motor'
+          npm install --global --no-audit --no-fund --prefix $dir "@openai/codex@$($env:CODEX_VERSION)" | Out-Host
+          "ST01_CODEX_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: measure
+        shell: pwsh
+        run: |
+          "os $([Environment]::OSVersion.VersionString)"
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          $env:ST01_APP = $env:AS_ASAR; $env:ST01_CHANNEL = 'prod'; $env:ST01_ARMS = 'urun'; $env:ST01_ETIKET = $env:TC_RUNNER
+          $env:ST01_ENGINES = 'codex'; $env:ST01_CASES = 'kisa,turkce,uzun5k'; $env:ST01_REPEAT = $env:TC_REPEAT
+          $env:ST01_IZ = '1'; $env:ST01_GEC_ENTER = '1'; $env:ST01_WAIT_MS = '12000'
+          $out = Join-Path $env:RUNNER_TEMP 'tc-out.txt'
+          $p = Start-Process -FilePath $env:AS_EXE -ArgumentList 'scripts/teslim-codex/sohbetTeslimProbe.cjs' -NoNewWindow -PassThru -Wait -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+          Get-Content -Encoding UTF8 $out
+          Get-Content -Encoding UTF8 "$out.err" -ErrorAction SilentlyContinue | Select-Object -Last 8
+          "probe exit $($p.ExitCode)"
