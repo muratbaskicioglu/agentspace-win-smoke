@@ -32,6 +32,8 @@ const ETIKET = process.env.ST01_ETIKET || null;
 const FORM = process.env.ST01_FORM || 'eski';
 const IZ = process.env.ST01_IZ === '1';
 const GEC_ENTER = process.env.ST01_GEC_ENTER === '1';
+// Enter'ı boşluktan önce bastır: metin işlenirken giden Enter'ı (sahadaki nadir sıra) her atışta üretir.
+const ERKEN_ENTER = Number(process.env.ST01_ERKEN_ENTER) || 0;
 const say = (o) => console.log('WINTEST st01 ' + JSON.stringify(ETIKET ? { etiket: ETIKET, tekrar_no: Number(process.env.ST01_REP) || 0, ...o } : o));
 const FAKE_ANTHROPIC = 'sk-ant-api03-probe-not-a-real-key-000000000000000000000000';
 const COLS = 120; const ROWS = 32;
@@ -262,7 +264,7 @@ async function deliver(s, engine, text) {
   const io = {
     readPaneBuffer: () => composer(s),
     writePane: (_i, d) => { writes.push(d.length); if (IZ) iz.push({ t: Date.now() - t0, yaz: d === '\r' ? 'ENTER' : d.length }); wrapped.write(d); return true; },
-    sleep, now: () => Date.now(), livePaneCount: () => 1,
+    sleep: (ms) => sleep(ERKEN_ENTER && !writes.includes(1) && ms >= 1000 ? ERKEN_ENTER : ms), now: () => Date.now(), livePaneCount: () => 1,
     bracketedPasteMode: () => { try { return s.screen.term.modes.bracketedPasteMode === true; } catch { return null; } },
     log: () => {},
   };
@@ -279,7 +281,7 @@ async function gecEnter(s, engine, h, before) {
   for (let i = 0; i < 3; i += 1) {
     const t0 = Date.now();
     let onceki = composer(s); let durgun = Date.now();
-    while (Date.now() - durgun < 1500 && Date.now() - t0 < 15000) {
+    while (Date.now() - durgun < (Number(process.env.ST01_GEC_DURGUN_MS) || 1500) && Date.now() - t0 < 15000) {
       await sleep(100);
       const c = composer(s);
       if (c !== onceki) { onceki = c; durgun = Date.now(); }
@@ -425,13 +427,15 @@ async function realEngine(engine, armId, cap) {
       const d = CASES[caseId].klavye ? await typeLikeHuman(pane.s, engine, text) : await deliver(pane.s, engine, text);
       // Uzun metin kutuda bekleyebilir (OpenCode 8 KB): "gelmedi" demeden önce yavaş boyamaya süre tanı.
       const ulasti = await waitFor(() => ORACLE[engine](pane.h).length > before.length, Number(process.env.ST01_WAIT_MS) || 25000, 400);
-      await sleep(2500);
+      await sleep(process.env.ST01_ARA_MS ? Number(process.env.ST01_ARA_MS) : 2500);
       if (d._dur) d._dur();
       const iz = d._iz; delete d._iz; delete d._dur; delete d._t0;
       const kutu = composer(pane.s).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200);
       const ekran = s_tail(pane.s);
       const kurtarma = GEC_ENTER && !ulasti ? await gecEnter(pane.s, engine, pane.h, before.length) : undefined;
       if (kurtarma) await sleep(2500);
+      // Fazladan Enter zararsız mı: mesaj gittikten sonra boş kutuya bir Enter daha; ikinci mesaj doğmamalı.
+      if (kurtarma && process.env.ST01_UCUNCU_ENTER === '1') { pane.s.c.write('\r'); await sleep(2500); }
       const after = ORACLE[engine](pane.h).slice(before.length);
       say({ motor: engine, kol: armId, vaka: caseId, sn: Math.round((Date.now() - t0) / 1000), ...d, ilk_ulasti: ulasti, ...compare(text, after), once: before.length, kutu, ...(kurtarma ? { kurtarma } : {}), ...(after.length === 1 && norm(after[0]) === norm(text) ? {} : { ekran }), ...(iz && (!ulasti || Number(process.env.ST01_REP) <= 2) ? { iz } : {}) });
       await quiet(pane.s, pane.def.busy, 45000, pane.def.needQuiet);
