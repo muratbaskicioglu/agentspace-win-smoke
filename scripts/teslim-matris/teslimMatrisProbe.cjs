@@ -308,6 +308,16 @@ async function cocuk(hucreId) {
   }
 
   // Bir gönderim: oda + teslim zinciri o atım için kurulur (defter boş, açık soru temiz).
+  // Teşhis: motorun kendi kaydı kırmızı satırda dursun (oturum defteri + günlük sonu; yalnız prob metni taşır).
+  function motorIzi(p) {
+    if (!p.h || !p.h.codexHome) return null;
+    const dosyalar = dolas(p.h.codexHome).filter((f) => /\.(jsonl|log)$/.test(f));
+    return dosyalar.slice(-6).map((f) => {
+      let m = ''; try { m = fs.readFileSync(f, 'utf8'); } catch { /* */ }
+      return { dosya: path.basename(f).slice(0, 40), bayt: m.length, son: m.slice(-700).replace(/[A-Za-z]:\\[^\s"]*/g, '<yol>') };
+    });
+  }
+
   async function atim(p, kol, sabotaj) {
     const ev = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-oda-'));
     const onceki = defter().length;
@@ -332,7 +342,7 @@ async function cocuk(hucreId) {
         // Teşhis: yazımdan sonra kutu ne gösterdi? Mesajın nerede kaybolduğu kırmızı satırda okunsun.
         for (const ms of [300, 2000]) {
           setTimeout(() => {
-            try { anlik.push({ yazim: yazilan.length, ms, bayt: p.bytes, kutu: kutu(p).split('\n').filter((l) => l.trim()).slice(-2).join(' | ').slice(-160) }); } catch { /* */ }
+            try { anlik.push({ yazim: yazilan.length, ms, bayt: p.bytes, ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-7).map((l) => l.trimEnd().slice(0, 90)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>') }); } catch { /* */ }
           }, ms);
         }
         return true;
@@ -398,7 +408,7 @@ async function cocuk(hucreId) {
       kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200),
       // Ham bayt: yalnız sabit prob metni taşır, kişisel veri yok.
       gonderilen, alinan,
-      ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, anlik, yakalayici: cap.iz.slice(-6) }),
+      ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, anlik, yakalayici: cap.iz.slice(-6), motor_izi: motorIzi(p) }),
       ...(hukum.gecti ? {} : { ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-12).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>').replace(/\/(Users|home|private|var|tmp)\/[^\s]*/g, '<yol>') }),
     };
     fs.appendFileSync(hamDosya(motor), `${JSON.stringify(satir)}\n`);
