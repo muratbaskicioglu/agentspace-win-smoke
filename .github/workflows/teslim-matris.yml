@@ -1,0 +1,255 @@
+# Chat delivery matrix: message x entry x engine x OS, on PUBLISHED AgentSpace packages.
+#
+# Each job downloads a published package from agentspace-releases, checks its sha256, and runs the
+# app's OWN room + delivery modules (loaded from the package) against a real terminal and an engine.
+# Verdict = bytes the engine received; what the app says about delivery is logged but never trusted.
+# Real CLIs use a fake key and a local capture server: nothing reaches any model. Antigravity has no
+# account here, so its cells run against a fake TUI and the table says so.
+#
+# Only a PUBLISHED package (downloaded, sha256 checked) + test scripts. No secrets. No product source.
+# Standard runners only (free on a public repo). Called by the app repo release gate.
+name: teslim matris
+
+run-name: teslim matris ${{ inputs.tag }} ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release tag'
+        required: true
+        type: string
+      win_sha256:
+        description: 'sha256 of AgentSpace-Setup-<version>.exe (empty = skip Windows)'
+        required: false
+        type: string
+        default: ''
+      mac_sha256:
+        description: 'sha256 of AgentSpace-<version>-arm64.dmg (empty = skip macOS)'
+        required: false
+        type: string
+        default: ''
+      linux_x64_sha256:
+        description: 'sha256 of AgentSpace-<version>-x86_64.AppImage (empty = skip Linux x64)'
+        required: false
+        type: string
+        default: ''
+      linux_arm64_sha256:
+        description: 'sha256 of AgentSpace-<version>-arm64.AppImage (empty = skip Linux arm64)'
+        required: false
+        type: string
+        default: ''
+      runners:
+        description: 'JSON list of runners'
+        required: false
+        type: string
+        default: '["windows-2025","windows-2022","windows-11-arm","macos-15","macos-26","ubuntu-24.04","ubuntu-24.04-arm"]'
+      engines:
+        description: 'JSON list of engines'
+        required: false
+        type: string
+        default: '["claude","codex","opencode","antigravity"]'
+      repeat:
+        description: 'Sends per cell'
+        required: false
+        type: string
+        default: '10'
+      positive:
+        description: 'Also run the sabotage arms (must go red)'
+        required: false
+        type: boolean
+        default: true
+      entries:
+        description: 'Comma list of entries (empty = all)'
+        required: false
+        type: string
+        default: ''
+      messages:
+        description: 'Comma list of messages (empty = all)'
+        required: false
+        type: string
+        default: ''
+      request_id:
+        description: 'Shown in the run name so the caller can find its run'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: ${{ matrix.runner }} ${{ matrix.engine }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners) }}
+        engine: ${{ fromJSON(inputs.engines) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    env:
+      CODEX_VERSION: '0.162.0'
+      OPENCODE_VERSION: '1.18.18'
+      CLAUDE_VERSION: '2.1.300'
+      TM_TAG: ${{ inputs.tag }}
+      TM_RUNNER: ${{ matrix.runner }}
+      TM_ENGINE: ${{ matrix.engine }}
+      TM_REPEAT: ${{ inputs.repeat }}
+      TM_POS: ${{ inputs.positive && '1' || '0' }}
+      TM_ENTRIES: ${{ inputs.entries }}
+      TM_MESSAGES: ${{ inputs.messages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/teslim-matris
+
+      - name: check inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "::error::bad tag"; exit 1; }
+          [[ "$TM_RUNNER" =~ ^(windows-2025|windows-2022|windows-11-arm|macos-15|macos-26|ubuntu-24\.04|ubuntu-24\.04-arm)$ ]] || { echo "::error::bad runner"; exit 1; }
+          [[ "$TM_REPEAT" =~ ^[0-9]{1,2}$ ]] || { echo "::error::bad repeat"; exit 1; }
+          [[ "$TM_ENGINE" =~ ^(claude|codex|opencode|antigravity)$ ]] || { echo "::error::bad engine"; exit 1; }
+          [[ "$TM_ENTRIES" =~ ^[a-z_,]*$ ]] || { echo "::error::bad entries"; exit 1; }
+          [[ "$TM_MESSAGES" =~ ^[a-z0-9_,]*$ ]] || { echo "::error::bad messages"; exit 1; }
+
+      - name: Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WANT: ${{ inputs.win_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:WANT -cnotmatch '^[0-9a-f]{64}$') { Write-Host "::error::bad sha256"; exit 1 }
+          $ver = $env:TM_TAG.Substring(1)
+          $asset = "AgentSpace-Setup-$ver.exe"
+          New-Item -ItemType Directory -Force -Path smoke-input | Out-Null
+          $dst = Join-Path 'smoke-input' $asset
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$($env:TM_TAG)/$asset" -OutFile $dst -UseBasicParsing
+          $got = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:WANT) { Write-Host "::error::sha256 mismatch"; exit 1 }
+          $p = Start-Process -FilePath (Resolve-Path $dst).Path -ArgumentList '/S' -PassThru -Wait
+          "installer exit $($p.ExitCode)"
+          $exe = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Depth 2 -Filter 'AgentSpace.exe' -File | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::AgentSpace.exe not found"; exit 1 }
+          "AS_EXE=$($exe.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "AS_ASAR=$(Join-Path $exe.DirectoryName 'resources\app.asar')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          WANT: ${{ inputs.mac_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$WANT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256"; exit 1; }
+          asset="AgentSpace-${TM_TAG#v}-arm64.dmg"
+          mkdir -p smoke-input
+          curl -fsSL --retry 3 -o "smoke-input/$asset" "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$TM_TAG/$asset"
+          [[ "$(shasum -a 256 "smoke-input/$asset" | cut -d' ' -f1)" == "$WANT" ]] || { echo "::error::sha256 mismatch"; exit 1; }
+          MNT="$RUNNER_TEMP/as-mnt"; mkdir -p "$MNT"
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$MNT" "smoke-input/$asset" >/dev/null
+          APP="$(ls -d "$MNT"/*.app | head -1)"
+          cp -R "$APP" "$RUNNER_TEMP/AgentSpace.app"
+          hdiutil detach "$MNT" -force -quiet || true
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/AgentSpace.app" 2>/dev/null || true
+          echo "AS_EXE=$RUNNER_TEMP/AgentSpace.app/Contents/MacOS/AgentSpace" >> "$GITHUB_ENV"
+          echo "AS_ASAR=$RUNNER_TEMP/AgentSpace.app/Contents/Resources/app.asar" >> "$GITHUB_ENV"
+
+      - name: Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          WANT_X64: ${{ inputs.linux_x64_sha256 }}
+          WANT_ARM: ${{ inputs.linux_arm64_sha256 }}
+        run: |
+          set -euo pipefail
+          case "$TM_RUNNER" in *-arm) arch=arm64; WANT="$WANT_ARM" ;; *) arch=x86_64; WANT="$WANT_X64" ;; esac
+          [[ "$WANT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256"; exit 1; }
+          asset="AgentSpace-${TM_TAG#v}-$arch.AppImage"
+          mkdir -p smoke-input
+          curl -fsSL --retry 3 -o "smoke-input/$asset" "https://github.com/muratbaskicioglu/agentspace-releases/releases/download/$TM_TAG/$asset"
+          [[ "$(sha256sum "smoke-input/$asset" | cut -d' ' -f1)" == "$WANT" ]] || { echo "::error::sha256 mismatch"; exit 1; }
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libgtk-3-0t64 libgbm1 libasound2t64 libxss1 libnotify4 libxtst6 >/dev/null 2>&1 || true
+          chmod +x "smoke-input/$asset"
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/smoke-input/$asset" --appimage-extract >/dev/null)
+          ROOT="$RUNNER_TEMP/squashfs-root"
+          EXE="$(find "$ROOT" -maxdepth 1 -type f -perm -u+x ! -name '*.so*' ! -name 'chrome*' ! -name 'AppRun' ! -name '*.sh' | head -1)"
+          [[ -x "$EXE" ]] || { echo "::error::app binary not found"; exit 1; }
+          echo "AS_EXE=$EXE" >> "$GITHUB_ENV"
+          echo "AS_ASAR=$ROOT/resources/app.asar" >> "$GITHUB_ENV"
+
+      - name: real engine (Windows)
+        if: runner.os == 'Windows' && matrix.engine != 'antigravity'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'motor'
+          switch ($env:TM_ENGINE) {
+            'codex' { npm install --global --no-audit --no-fund --prefix $dir "@openai/codex@$($env:CODEX_VERSION)" | Out-Host; "TM_CODEX_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV }
+            'opencode' { npm install --global --no-audit --no-fund --prefix $dir "opencode-ai@$($env:OPENCODE_VERSION)" | Out-Host; "TM_OPENCODE_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV }
+            'claude' {
+              # The way the app itself installs Claude Code on a customer machine.
+              & ([scriptblock]::Create((Invoke-RestMethod -UseBasicParsing https://claude.ai/install.ps1))) $env:CLAUDE_VERSION | Out-Host
+              "TM_CLAUDE_DIR=$(Join-Path $env:USERPROFILE '.local\bin')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            }
+          }
+
+      - name: real engine (macOS, Linux)
+        if: runner.os != 'Windows' && matrix.engine != 'antigravity'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/motor"
+          case "$TM_ENGINE" in
+            codex) npm install --global --no-audit --no-fund --prefix "$dir" "@openai/codex@$CODEX_VERSION" >/dev/null; echo "TM_CODEX_DIR=$dir/bin" >> "$GITHUB_ENV" ;;
+            opencode) npm install --global --no-audit --no-fund --prefix "$dir" "opencode-ai@$OPENCODE_VERSION" >/dev/null; echo "TM_OPENCODE_DIR=$dir/bin" >> "$GITHUB_ENV" ;;
+            claude) curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION" >/dev/null; echo "TM_CLAUDE_DIR=$HOME/.local/bin" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: matrix (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'teslim-out'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          "os $([Environment]::OSVersion.VersionString)"
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          $env:TM_APP = $env:AS_ASAR; $env:TM_OUT = $out; $env:TM_SURUM = $env:TM_TAG; $env:TM_KULVAR = $env:TM_RUNNER
+          $env:TM_MOTORLAR = $env:TM_ENGINE; $env:TM_TEKRAR = $env:TM_REPEAT; $env:TM_POZITIF = $env:TM_POS
+          if ($env:TM_ENTRIES) { $env:TM_GIRISLER = $env:TM_ENTRIES }
+          if ($env:TM_MESSAGES) { $env:TM_MESAJLAR = $env:TM_MESSAGES }
+          $p = Start-Process -FilePath $env:AS_EXE -ArgumentList 'scripts/teslim-matris/teslimMatrisProbe.cjs' -NoNewWindow -PassThru -Wait `
+            -RedirectStandardOutput (Join-Path $out 'surucu.out.txt') -RedirectStandardError (Join-Path $out 'surucu.err.txt')
+          Get-Content (Join-Path $out 'surucu.out.txt') -Tail 20
+          "probe exit $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: matrix (macOS, Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          out="$GITHUB_WORKSPACE/teslim-out"; mkdir -p "$out"
+          uname -a
+          export ELECTRON_RUN_AS_NODE=1 TM_APP="$AS_ASAR" TM_OUT="$out" TM_SURUM="$TM_TAG" TM_KULVAR="$TM_RUNNER" TM_MOTORLAR="$TM_ENGINE" TM_TEKRAR="$TM_REPEAT" TM_POZITIF="$TM_POS"
+          [[ -n "$TM_ENTRIES" ]] && export TM_GIRISLER="$TM_ENTRIES"
+          [[ -n "$TM_MESSAGES" ]] && export TM_MESAJLAR="$TM_MESSAGES"
+          "$AS_EXE" scripts/teslim-matris/teslimMatrisProbe.cjs 2>"$out/surucu.err.txt" | tee "$out/surucu.out.txt" | tail -20
+          exit "${PIPESTATUS[0]}"
+
+      - name: upload raw bytes
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: teslim-matris-${{ matrix.runner }}-${{ matrix.engine }}-${{ github.run_id }}
+          path: teslim-out
+          retention-days: 7
+          if-no-files-found: warn
