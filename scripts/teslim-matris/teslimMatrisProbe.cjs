@@ -20,6 +20,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const zlib = require('node:zlib');
 const K = require('./katalog.cjs');
 
 const EL = process.env.TM_APP;
@@ -43,19 +44,28 @@ const say = (o) => console.log(`TM ${JSON.stringify(o)}`);
 const hamDosya = (motor) => path.join(OUT, `ham-${KULVAR}-${SURUM}-${motor}.jsonl`);
 const sha = (s) => crypto.createHash('sha256').update(String(s), 'utf8').digest('hex').slice(0, 16);
 
+function hucreDefteri(motor, hucreId) { return jsonl(hamDosya(motor)).filter((x) => x.hucre === hucreId); }
+function hucreTamam(motor, hucreId) {
+  const d = hucreDefteri(motor, hucreId);
+  if (d.some((x) => (x.sebepler || []).includes('motor_acilmadi'))) return true;
+  if (d.filter((x) => x.kol === 'ana').length < TEKRAR) return false;
+  return !POZITIF || ['bayt', 'enter'].every((z) => d.some((x) => x.kol === 'pozitif' && x.sabotaj === z));
+}
+
 function surucu() {
   fs.mkdirSync(OUT, { recursive: true });
   const hucreler = K.hucreler(MOTORLAR).filter((h) => GIRISLER.includes(h.giris) && MESAJLAR.includes(h.mesaj));
   say({ asama: 'surucu', surum: SURUM, kulvar: KULVAR, platform: process.platform, release: os.release(), arch: os.arch(), hucre: hucreler.length, tekrar: TEKRAR, pozitif: POZITIF });
   for (const h of hucreler) {
     const t0 = Date.now();
-    // Her hücre ayrı süreç: node-pty kapanışta süreci düşürebiliyor (0xC0000374); bir hücrenin çöküşü ötekini götürmesin.
-    const r = cp.spawnSync(process.execPath, [__filename], {
-      stdio: 'inherit',
-      timeout: 20 * 60_000,
-      env: { ...process.env, TM_COCUK: h.id },
-    });
-    if (r.status !== 0) {
+    // Her hücre ayrı süreç: node-pty Windows'ta pane kapanışında süreci düşürebiliyor (0xC0000374). Çocuk
+    // defterden kaldığı atımı okur; düşerse sürücü aynı hücreyi sürdürür, ölçüm kaybolmaz.
+    let r; let deneme = 0;
+    do {
+      r = cp.spawnSync(process.execPath, [__filename], { stdio: 'inherit', timeout: 20 * 60_000, env: { ...process.env, TM_COCUK: h.id } });
+      deneme += 1;
+    } while (!hucreTamam(h.motor, h.id) && deneme < TEKRAR + 6);
+    if (!hucreTamam(h.motor, h.id)) {
       fs.appendFileSync(hamDosya(h.motor), `${JSON.stringify({ hucre: h.id, kol: 'ana', gecti: false, sebepler: ['prob_dustu'], cikis: r.status, sinyal: r.signal, surum: SURUM, kulvar: KULVAR })}\n`);
     }
     say({ asama: 'hucre', hucre: h.id, sn: Math.round((Date.now() - t0) / 1000), cikis: r.status });
@@ -63,28 +73,51 @@ function surucu() {
 }
 
 // ── yerel yakalayıcı: gerçek CLI'nin modele sandığı yer ──
+function govdeAc(buf, kodlama) {
+  const k = String(kodlama || '').toLowerCase();
+  if (k === 'gzip') return zlib.gunzipSync(buf);
+  if (k === 'br') return zlib.brotliDecompressSync(buf);
+  if (k === 'deflate') return zlib.inflateSync(buf);
+  if (k === 'zstd') return zlib.zstdDecompressSync(buf);
+  return buf;
+}
 function yakalayici() {
   const got = [];
+  // Teşhis: oracle boş kaldığında "mesaj gitmedi" ile "yakalayıcı okuyamadı" ayrılabilsin.
+  const iz = [];
   const srv = http.createServer((req, res) => {
     const parts = [];
     req.on('data', (c) => parts.push(c));
     req.on('end', () => {
+      const kayit = { yol: req.url, kodlama: req.headers['content-encoding'] || null, bayt: 0 };
       try {
-        const j = JSON.parse(Buffer.concat(parts).toString('utf8'));
+        const ham = Buffer.concat(parts);
+        kayit.bayt = ham.length;
+        const j = JSON.parse(govdeAc(ham, kayit.kodlama).toString('utf8'));
         const list = Array.isArray(j.messages) ? j.messages : Array.isArray(j.input) ? j.input : [];
         const ms = list.filter((m) => m && m.role === 'user');
+        kayit.liste = list.length; kayit.user = ms.length;
         const last = ms[ms.length - 1];
         if (last) {
           const c = last.content;
           const t = typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (x && x.text) || '').join('') : '';
+          kayit.son_bayt = Buffer.byteLength(t || '', 'utf8');
           if (t && got[got.length - 1] !== t) got.push(t);
         }
-      } catch { /* gövde değil */ }
+      } catch (e) { kayit.hata = String(e && e.message).slice(0, 120); }
+      iz.push(kayit);
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end('{"error":{"message":"tm probe","type":"invalid_request_error"}}');
     });
   });
-  return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ got, port: srv.address().port, stop: () => srv.close() })));
+  return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ got, iz, port: srv.address().port, stop: () => srv.close() })));
+}
+
+function nodeYolu() {
+  const r = cp.spawnSync('where', ['node'], { encoding: 'utf8' });
+  const y = String(r.stdout || '').split(/\r?\n/).map((x) => x.trim()).find((x) => /\.exe$/i.test(x));
+  if (!y) throw new Error('sahte TUI için node bulunamadı');
+  return y;
 }
 
 function evAc(tag) {
@@ -201,7 +234,8 @@ async function cocuk(hucreId) {
       h = evAc('sahte');
       h.log = path.join(h.home, 'tui.jsonl');
       fs.writeFileSync(h.log, '');
-      file = process.execPath;
+      // AgentSpace.exe Windows'ta GUI uygulaması: konsola bağlanmaz, stdin TTY olmaz. Sahte TUI gerçek node ile.
+      file = IS_WIN && process.versions.electron ? nodeYolu() : process.execPath;
       argv = [path.join(__dirname, 'sahteTui.cjs'), h.log];
       env = { ...process.env };
       delete env.TM_COCUK;
@@ -350,18 +384,23 @@ async function cocuk(hucreId) {
       kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200),
       // Ham bayt: yalnız sabit prob metni taşır, kişisel veri yok.
       gonderilen, alinan,
+      ...(hukum.gecti ? {} : { yakalayici: cap.iz.slice(-6) }),
       ...(hukum.gecti ? {} : { ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-12).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>').replace(/\/(Users|home|private|var|tmp)\/[^\s]*/g, '<yol>') }),
     };
     fs.appendFileSync(hamDosya(motor), `${JSON.stringify(satir)}\n`);
     try { oda.stop(); } catch { /* */ }
-    try { fs.rmSync(ev, { recursive: true, force: true, maxRetries: 3 }); } catch { /* */ }
+    // murat-win'de toplu silme yok: TMP = RUNNER_TEMP, iş bitince koşucu kendi temizler.
+    if (KULVAR !== 'murat-win') { try { fs.rmSync(ev, { recursive: true, force: true, maxRetries: 3 }); } catch { /* */ } }
     return hukum;
   }
 
+  const onceki = hucreDefteri(motor, hucreId);
+  if (hucreTamam(motor, hucreId)) process.exit(0);
+  const anaBitti = onceki.filter((x) => x.kol === 'ana').length;
   let pane = paneAc();
   let acildi = await hazirla(pane);
   const yeniden = async () => { paneKapat(pane); await sleep(500); pane = paneAc(); acildi = await hazirla(pane); };
-  for (let i = 0; i < TEKRAR; i++) {
+  for (let i = anaBitti; i < TEKRAR; i++) {
     if (!acildi || pane.cikis !== null) await yeniden();
     if (!acildi) {
       fs.appendFileSync(hamDosya(motor), `${JSON.stringify({ surum: SURUM, kulvar: KULVAR, hucre: hucreId, motor, giris, mesaj, kol: 'ana', gecti: false, sebepler: ['motor_acilmadi'], cikis: pane.cikis, ekran: canli(pane).slice(-400) })}\n`);
@@ -374,6 +413,7 @@ async function cocuk(hucreId) {
   }
   if (POZITIF && acildi) {
     for (const sabotaj of ['bayt', 'enter']) {
+      if (onceki.some((x) => x.kol === 'pozitif' && x.sabotaj === sabotaj)) continue;
       await yeniden();
       if (!acildi) break;
       await atim(pane, 'pozitif', sabotaj);
