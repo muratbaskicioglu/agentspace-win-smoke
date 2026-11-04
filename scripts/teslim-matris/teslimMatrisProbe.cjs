@@ -183,7 +183,7 @@ const GERCEK = {
         const c = e.message.content;
         return typeof c === 'string' ? c : Array.isArray(c) ? c.filter((x) => x && x.type === 'text').map((x) => x.text).join('') : '';
       }).filter(Boolean),
-    hazir: /❯|Try "|for shortcuts/, mesgul: /esc to interrupt/, sessiz: 3000,
+    hazir: /^\s*[❯>]|Try "|for shortcuts|bypass permissions/m, mesgul: /esc to interrupt/, sessiz: 3000,
   },
   opencode: {
     kur(cap) {
