@@ -273,7 +273,7 @@ async function cocuk(hucreId) {
     const child = pty.spawn(file, argv, { name: 'xterm-256color', cols: COLS, rows: ROWS, cwd: h.work, env, ...(IS_WIN ? { useConpty: true } : {}) });
     const screen = paneScreen.createPaneScreen({ cols: COLS, rows: ROWS, scrollback: 500 });
     const p = { h, child, screen, cikis: null, bytes: 0, lastDataAt: 0, entry: {} };
-    child.onData((d) => { p.bytes += d.length; p.lastDataAt = Date.now(); try { screen.write(d); } catch { /* */ } });
+    child.onData((d) => { p.bytes += d.length; p.lastDataAt = Date.now(); if (p.hamIz != null && p.hamIz.length < 60000) p.hamIz += d; try { screen.write(d); } catch { /* */ } });
     child.onExit((e) => { p.cikis = e.exitCode; });
     // main.js:6341 ile aynı: motor Windows'ta yazma kodlayıcısını taşır.
     if (winInput) winInput.wrapWrite(child, { engine: SAHTE ? 'antigravity' : motor, platform: process.platform });
@@ -318,6 +318,12 @@ async function cocuk(hucreId) {
     });
   }
 
+  // Teşhis: ilk yazımdan sonra motorun ürettiği ham çıktı; denetim dizileri açılmış, görünür metin kesilmiş.
+  function hamOzet(p) {
+    const h = p.hamIz || '';
+    const metin = h.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, (m) => (/[ABCDHJKfGdr]$/.test(m) ? '~' : '')).replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').replace(/~+/g, '~').replace(/[A-Za-z]:\\[^\s~]*/g, '<yol>');
+    return { bayt: h.length, bas: metin.slice(0, 1500), son: metin.slice(-800) };
+  }
   async function atim(p, kol, sabotaj) {
     const ev = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-oda-'));
     const onceki = defter().length;
@@ -338,6 +344,7 @@ async function cocuk(hucreId) {
         if (sabotaj === 'enter' && typeof d === 'string' && /^\r+$/.test(d)) { enterYutuldu += 1; return true; }
         if (typeof d === 'string' && /[^\r\n]/.test(d)) { entry.lastMachineTextAt = Date.now(); entry.lastMachineText = d; }
         yazilan.push(typeof d === 'string' ? d.length : 0);
+        if (p.hamIz == null) p.hamIz = '';
         p.child.write(d);
         // Teşhis: yazımdan sonra kutu ne gösterdi? Mesajın nerede kaybolduğu kırmızı satırda okunsun.
         for (const ms of [300, 2000]) {
@@ -408,7 +415,7 @@ async function cocuk(hucreId) {
       kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200),
       // Ham bayt: yalnız sabit prob metni taşır, kişisel veri yok.
       gonderilen, alinan,
-      ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, anlik, yakalayici: cap.iz.slice(-6), motor_izi: motorIzi(p) }),
+      ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, anlik, yakalayici: cap.iz.slice(-6), motor_izi: motorIzi(p), ham_cikti: hamOzet(p) }),
       ...(hukum.gecti ? {} : { ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-12).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>').replace(/\/(Users|home|private|var|tmp)\/[^\s]*/g, '<yol>') }),
     };
     fs.appendFileSync(hamDosya(motor), `${JSON.stringify(satir)}\n`);
