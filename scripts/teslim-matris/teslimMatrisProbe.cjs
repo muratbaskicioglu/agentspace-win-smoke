@@ -403,7 +403,7 @@ async function cocuk(hucreId) {
       homedir: ev,
       listPanes: () => [{ paneId: 'pane-1', agentId, exited: false, department: DEPT }],
       readPaneScreen: () => canli(p),
-      deliver: (req) => { gonderilen = req.text; return agentx.deliverConfirmed(req); },
+      deliver: (req) => { if (M.govde.includes('\n')) req = { ...req, text: req.text.replace(M.govde.replace(/\s*\n\s*/g, ' '), M.govde) }; gonderilen = req.text; return agentx.deliverConfirmed(req); },
       ledger: () => LEDGER,
       config: { replyPollMs: 500, replyBudgetMs: 1000 },
       sleep,
