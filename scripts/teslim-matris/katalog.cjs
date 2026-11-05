@@ -101,7 +101,8 @@ function atimHukmu({ govde, gonderilen, alinan }) {
   if (sent) {
     if (got.length === 0) sebepler.push('gonderilmedi');
     else if (got.length > 1) sebepler.push('cift_mesaj');
-    else if (got[0] !== sent) sebepler.push('bayt_farki');
+    // Yine kırmızı. Ad yalnız düzeltecek kişiye içerik kaybı olmadığını söyler.
+    else if (got[0] !== sent) sebepler.push(got[0].replace(/\s+/g, ' ') === sent.replace(/\s+/g, ' ') ? 'yalniz_bosluk_farki' : 'bayt_farki');
   }
   let at = 0;
   const bir = got.length ? got[0] : '';

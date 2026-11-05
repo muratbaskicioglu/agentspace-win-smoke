@@ -223,6 +223,7 @@ async function cocuk(hucreId) {
   let winInput = null;
   try { winInput = app('platform/winConsoleInput.cjs'); } catch { /* eski sürümde yok */ }
   const treeKill = (() => { try { return app('platform/ptyTreeKill.cjs'); } catch { return null; } })();
+  const conptyKarar = (() => { try { return app('platform/conptyOption.cjs'); } catch { return null; } })();
 
   const G = K.GIRISLER[giris];
   const M = K.MESAJLAR[mesaj];
@@ -277,9 +278,15 @@ async function cocuk(hucreId) {
       }
       defter = () => def.defter(h, cap);
     }
-    const child = pty.spawn(file, argv, { name: 'xterm-256color', cols: COLS, rows: ROWS, cwd: h.work, env, ...(IS_WIN ? { useConpty: true } : {}) });
+    // main.js spawnPty ile aynı: dll kararı ürünün, prod kanalı ve motor adıyla. Prob kendi seçerse düzeltilmiş sürüm yine kırmızı çıkar.
+    const taban = { name: 'xterm-256color', cols: COLS, rows: ROWS, cwd: h.work, env, ...(IS_WIN ? { useConpty: true } : {}) };
+    const dll = conptyKarar ? conptyKarar.conptyDllVerdict({ channel: 'prod', engine: SAHTE ? 'antigravity' : motor }) : { options: {}, reason: 'modul_yok' };
+    let conpty = dll.reason;
+    const child = conptyKarar
+      ? conptyKarar.spawnWithConptyFallback(pty.spawn, file, argv, taban, dll.options, () => { conpty = 'dll_dustu'; })
+      : pty.spawn(file, argv, taban);
     const screen = paneScreen.createPaneScreen({ cols: COLS, rows: ROWS, scrollback: 500 });
-    const p = { h, child, screen, cikis: null, bytes: 0, lastDataAt: 0, entry: {} };
+    const p = { h, child, screen, conpty, cikis: null, bytes: 0, lastDataAt: 0, entry: {} };
     child.onData((d) => { p.bytes += d.length; p.lastDataAt = Date.now(); if (p.hamIz != null && p.hamIz.length < 60000) p.hamIz += d; try { screen.write(d); } catch { /* */ } });
     child.onExit((e) => { p.cikis = e.exitCode; });
     // main.js:6341 ile aynı: motor Windows'ta yazma kodlayıcısını taşır.
@@ -304,7 +311,7 @@ async function cocuk(hucreId) {
     await sessiz(p);
     const hazir = ok && p.cikis === null;
     // Teşhis: motor neden hazır olmadı? Ekran yalnız CLI'nin kendi yazısı; yollar maskeli.
-    if (!hazir) console.error(`TM-TANI ${JSON.stringify({ hazir: ok, cikis: p.cikis, bayt: p.bytes, ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-14).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>') })}`);
+    if (!hazir) console.error(`TM-TANI ${JSON.stringify({ hazir: ok, cikis: p.cikis, bayt: p.bytes, ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-14).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/(?:[A-Za-z]:|~)\\[^\s]*/g, '<yol>') })}`);
     return hazir;
   }
   async function sessiz(p, ms = 60_000) {
@@ -361,7 +368,7 @@ async function cocuk(hucreId) {
         // Teşhis: yazımdan sonra kutu ne gösterdi? Mesajın nerede kaybolduğu kırmızı satırda okunsun.
         for (const ms of [300, 2000]) {
           setTimeout(() => {
-            try { anlik.push({ yazim: yazilan.length, ms, bayt: p.bytes, ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-7).map((l) => l.trimEnd().slice(0, 90)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>') }); } catch { /* */ }
+            try { anlik.push({ yazim: yazilan.length, ms, bayt: p.bytes, ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-7).map((l) => l.trimEnd().slice(0, 90)).join(' ¦ ').replace(/(?:[A-Za-z]:|~)\\[^\s]*/g, '<yol>') }); } catch { /* */ }
           }, ms);
         }
         return true;
@@ -424,11 +431,12 @@ async function cocuk(hucreId) {
       yazim: yazilan, enter_yutuldu: enterYutuldu, sn: Math.round((Date.now() - t0) / 100) / 10,
       gonderilen_sha: gonderilen == null ? null : sha(K.normal(gonderilen)),
       alinan_sha: alinan.map((a) => sha(K.normal(a))),
-      kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200).replace(/[A-Za-z]:\\[^\s]*/g, '<yol>'),
+      kutu_sonra: kutu(p).split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200).replace(/(?:[A-Za-z]:|~)\\[^\s]*/g, '<yol>'),
+      conpty: p.conpty,
       // Ham bayt: yalnız sabit prob metni taşır, kişisel veri yok.
       gonderilen, alinan,
       ...(hukum.gecti ? {} : { atim_basi_sn: atimBasi, onceki, anlik, yakalayici: cap.iz.slice(-6), motor_izi: motorIzi(p), ham_cikti: hamOzet(p) }),
-      ...(hukum.gecti ? {} : { ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-12).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/[A-Za-z]:\\[^\s]*/g, '<yol>').replace(/\/(Users|home|private|var|tmp)\/[^\s]*/g, '<yol>') }),
+      ...(hukum.gecti ? {} : { ekran: p.screen.liveLines().filter((l) => l.trim()).slice(-12).map((l) => l.trimEnd().slice(0, 110)).join(' ¦ ').replace(/(?:[A-Za-z]:|~)\\[^\s]*/g, '<yol>').replace(/\/(Users|home|private|var|tmp)\/[^\s]*/g, '<yol>') }),
     };
     fs.appendFileSync(hamDosya(motor), `${JSON.stringify(satir)}\n`);
     try { oda.stop(); } catch { /* */ }
